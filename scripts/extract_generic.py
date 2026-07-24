@@ -80,6 +80,24 @@ def get_mapping_from_claude(template_analysis, db_columns_text, transform_rules_
 ## 키워드 힌트 (참고용)
 {hint if hint else "(없음)"}
 
+## 마스터 DB 주요 컬럼 참조 (db_index 혼동 방지용)
+마스터 DB(기술이전총정리.xlsx)는 항상 동일한 구조입니다.
+양식 파일에 해당 항목이 있을 때만 아래 인덱스를 사용하세요.
+- db_index 1  → 계약일 (기술이전계약일)
+- db_index 3  → 기술도입업체명 (기관/업체명)
+- db_index 8  → 지역코드 (국내지역구분 코드)
+- db_index 28 → 기술명
+- db_index 29 → 주발명자/연구자명
+- db_index 37 → 기술유형
+- db_index 44 → 거래유형
+- db_index 51 → 경상기술료 조건 텍스트
+- db_index 52 → 정액기술료 계약금(원)
+- db_index 73 → 입금일
+- db_index 76 → 현금입금액(원)
+- db_index 82 → 경상기술료 입금액(원)
+- db_index 83 → 정액기술료 입금액(원)
+양식 파일에 없는 항목은 절대 포함하지 마세요.
+
 ---
 
 반드시 아래 JSON 형식으로만 응답하세요. 설명 없이 JSON 코드블록만 출력하세요.
@@ -176,8 +194,19 @@ domestic_foreign, bridge_type
     text = response.content[0].text
     m = re.search(r"```json\s*([\s\S]*?)\s*```", text)
     if m:
-        return json.loads(m.group(1))
-    return json.loads(text.strip())
+        result = json.loads(m.group(1))
+    else:
+        result = json.loads(text.strip())
+
+    # 매핑 결과 로그 출력 (디버깅용)
+    print(f"  📋 AI 매핑 결과:")
+    print(f"     시트: {result.get('target_sheet')} | 데이터시작행: {result.get('data_start_row')} | 필터: {result.get('filter_mode')} | 집계: {result.get('group_by_contract')}")
+    for col in result.get('columns', []):
+        if col.get('type') == 'db_value':
+            print(f"     열{col['col']} [{col.get('label','')}] ← DB[{col['db_index']}] ({col.get('transform','')})")
+        else:
+            print(f"     열{col['col']} [{col.get('label','')}] ← {col['type']} {col.get('value', col.get('db_indices', ''))}")
+    return result
 
 
 def get_contract_type(row):
