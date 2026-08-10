@@ -86,9 +86,11 @@ def ask_claude(notes: str, year: int, api_key: str) -> dict:
     추가 요청사항을 분석해서 추출할 열과 필터 조건을 반환.
     반환 형식:
     {
-      "columns": [0, 1, 3, ...],          # db_index 목록 (순서 유지)
+      "columns": [0, 1, 3, ...],
       "filter_mode": "contract"|"payment"|"both"|"none",
-      "filter_year": 2025,                # null이면 year 파라미터 사용
+      "filter_year": 2025,
+      "date_range": {"start": "YYYYMMDD", "end": "YYYYMMDD"} 또는 null,
+      "researcher_filter": ["이름1", "이름2", ...] 또는 null,
       "notes": "분석 설명"
     }
     """
@@ -110,6 +112,8 @@ def ask_claude(notes: str, year: int, api_key: str) -> dict:
   "columns": [정수 db_index 목록],
   "filter_mode": "contract" 또는 "payment" 또는 "both" 또는 "none",
   "filter_year": 연도_정수_또는_null,
+  "date_range": {{"start": "YYYYMMDD", "end": "YYYYMMDD"}} 또는 null,
+  "researcher_filter": ["이름1", "이름2"] 또는 null,
   "notes": "선택 이유 한 줄"
 }}
 
@@ -117,13 +121,16 @@ def ask_claude(notes: str, year: int, api_key: str) -> dict:
 - 요청사항에 특정 열이 언급되면 해당 열 포함
 - 연도 필터: 계약일 기준이면 "contract", 입금일 기준이면 "payment", 둘 다면 "both", 연도 무관이면 "none"
 - filter_year: 요청에 다른 연도가 있으면 그 연도, 없으면 null (기준 연도 {year} 사용)
-- 요청이 없거나 불명확하면 기본 주요 열 선택: [0,1,3,28,29,37,44,50,52,73,76]
+- date_range: "X월Y일~X월Y일", "YYYY년MM월DD일부터" 등 구체적 날짜 범위가 있으면 YYYYMMDD 형식으로 변환. 없으면 null
+- researcher_filter: 특정 연구자/발명자 이름 목록이 있으면 배열로 추출. 없으면 null
+- 추출 항목이 명시되지 않으면 columns는 빈 배열 [] 로 반환 (전체 열 추출로 처리됨)
+- 추출 항목이 명시된 경우에만 해당 db_index 목록을 반환
 - 열 순서는 db_index 오름차순으로 정렬
 - columns에는 중복 없이 정수만"""
 
     resp = client.messages.create(
         model="claude-haiku-4-5-20251001",
-        max_tokens=512,
+        max_tokens=1024,
         messages=[{"role": "user", "content": prompt}],
     )
     text = resp.content[0].text.strip()
@@ -134,6 +141,48 @@ def ask_claude(notes: str, year: int, api_key: str) -> dict:
     if m:
         return json.loads(m.group())
     raise ValueError(f"AI 응답에서 JSON을 파싱할 수 없습니다:\n{text}")
+
+
+def filter_by_date_range(rows, start_yyyymmdd: str, end_yyyymmdd: str,
+                         contract_col=1, payment_col=73, mode="both") -> list:
+    """날짜 범위(YYYYMMDD 문자열)로 행 필터링."""
+    def to_str(v) -> str:
+        return to_yyyymmdd(v) if v else ""
+
+    result = []
+    for row in rows:
+        c_str = to_str(row[contract_col] if contract_col < len(row) else None)
+        p_str = to_str(row[payment_col]  if payment_col  < len(row) else None)
+
+        def in_range(s):
+            return s and start_yyyymmdd <= s <= end_yyyymmdd
+
+        if mode == "contract":
+            if in_range(c_str): result.append(row)
+        elif mode == "payment":
+            if in_range(p_str): result.append(row)
+        else:  # both
+            if in_range(c_str) or in_range(p_str): result.append(row)
+    return result
+
+
+def filter_by_researchers(rows, names: list,
+                           inventor_col=29, co_inventor_col=33) -> list:
+    """주발명자 또는 공동발명자가 names 목록에 포함된 행만 반환."""
+    name_set = set(n.strip() for n in names if n.strip())
+
+    def matches(row):
+        inv    = str(row[inventor_col]    or "").strip() if inventor_col    < len(row) else ""
+        co_inv = str(row[co_inventor_col] or "").strip() if co_inventor_col < len(row) else ""
+        # 공동발명자는 여러 명이 구분자로 이어질 수 있음
+        if inv in name_set:
+            return True
+        for part in co_inv.replace(",", " ").replace("/", " ").replace(";", " ").split():
+            if part.strip() in name_set:
+                return True
+        return False
+
+    return [row for row in rows if matches(row)]
 
 
 def format_cell_value(value, db_index: int):
@@ -168,30 +217,52 @@ def run(master_path: str, year: int, output_path: str,
     print("[extract_columns] AI 분석 중...")
     try:
         ai_result = ask_claude(notes, year, api_key)
-        columns    = ai_result.get("columns") or DEFAULT_COLUMNS
-        filter_mode = ai_result.get("filter_mode", "both")
-        filter_year = ai_result.get("filter_year") or year
-        ai_notes   = ai_result.get("notes", "")
+        columns           = ai_result.get("columns") or DEFAULT_COLUMNS
+        filter_mode       = ai_result.get("filter_mode", "both")
+        filter_year       = ai_result.get("filter_year") or year
+        date_range        = ai_result.get("date_range")        # {"start": "YYYYMMDD", "end": "YYYYMMDD"} or None
+        researcher_filter = ai_result.get("researcher_filter") # list or None
+        ai_notes          = ai_result.get("notes", "")
         print(f"  AI 결정 - 열: {columns}, 필터: {filter_mode}, 연도: {filter_year}")
+        print(f"  날짜범위: {date_range}, 연구자: {researcher_filter}")
         print(f"  AI 설명: {ai_notes}")
     except Exception as e:
         print(f"  AI 분석 실패 ({e}), 기본값 사용")
-        columns     = DEFAULT_COLUMNS
-        filter_mode = "both"
-        filter_year = year
-        ai_notes    = "AI 분석 실패 → 기본 열 사용"
+        columns           = DEFAULT_COLUMNS
+        filter_mode       = "both"
+        filter_year       = year
+        date_range        = None
+        researcher_filter = None
+        ai_notes          = "AI 분석 실패 → 기본 열 사용"
 
-    # 유효 열 인덱스만 (0~104)
-    columns = sorted(set(c for c in columns if 0 <= c <= 104))
+    # 추출 항목 미지정이면 전체 열(0~104) 사용
+    if not columns:
+        columns = list(range(105))
+        print("  추출 항목 미지정 → 전체 열(0~104) 추출")
+    else:
+        columns = sorted(set(c for c in columns if 0 <= c <= 104))
 
-    # ── 필터링 ──────────────────────────────────────────────────────
-    if filter_mode == "none":
+    # ── 날짜 필터링 ─────────────────────────────────────────────────
+    if date_range and date_range.get("start") and date_range.get("end"):
+        start_d = date_range["start"]
+        end_d   = date_range["end"]
+        rows = filter_by_date_range(all_rows, start_d, end_d,
+                                    contract_col=1, payment_col=73, mode=filter_mode)
+        print(f"  날짜범위 필터 {start_d}~{end_d} ({filter_mode}) → {len(rows)}행")
+    elif filter_mode == "none":
         rows = all_rows
         print(f"  필터 없음 → {len(rows)}행")
     else:
         rows = filter_by_year(all_rows, filter_year,
                               contract_col=1, payment_col=73, mode=filter_mode)
         print(f"  {filter_year}년 필터({filter_mode}) → {len(rows)}행")
+
+    # ── 연구자 필터링 ────────────────────────────────────────────────
+    if researcher_filter:
+        before = len(rows)
+        rows = filter_by_researchers(rows, researcher_filter,
+                                     inventor_col=29, co_inventor_col=33)
+        print(f"  연구자 필터 {researcher_filter} → {before}행 → {len(rows)}행")
 
     # ── Excel 출력 ──────────────────────────────────────────────────
     wb = Workbook()
