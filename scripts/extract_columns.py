@@ -213,27 +213,68 @@ def run(master_path: str, year: int, output_path: str,
     all_rows = load_master_db(master_path)
     print(f"  전체 행수: {len(all_rows)}")
 
+    # ── 마스터 DB 유효성 검증 ────────────────────────────────────────
+    if all_rows and len(all_rows[0]) < 50:
+        raise ValueError(
+            f"❌ 마스터 DB 파일이 올바르지 않습니다.\n"
+            f"업로드한 파일의 열 수: {len(all_rows[0])}개 (정상: 105개)\n\n"
+            f"👉 '기술이전총정리_날짜.xlsx' 파일을 마스터 DB 칸에 올려주세요.\n"
+            f"   추출 결과 파일이나 양식 파일을 마스터 DB로 올리면 안 됩니다."
+        )
+
+    # ── Regex로 날짜범위·연구자 먼저 파싱 (AI 보조) ─────────────────
+    import re as _re
+    def _parse_notes(text):
+        """notes에서 날짜범위·필터기준·연구자 목록을 regex로 추출."""
+        res = {"date_start": None, "date_end": None, "date_mode": "both", "researchers": None}
+        m = _re.search(r'(20\d{6})\s*[~\-]\s*(20\d{6})', text)
+        if m:
+            res["date_start"] = m.group(1)
+            res["date_end"]   = m.group(2)
+        if "계약일" in text:
+            res["date_mode"] = "contract"
+        elif "입금일" in text:
+            res["date_mode"] = "payment"
+        rm = _re.search(r'(?:대상\s*)?연구자\s*[:：]\s*(.+)', text, _re.DOTALL)
+        if rm:
+            names = [n.strip() for n in _re.split(r'[,，/\n]', rm.group(1)) if n.strip()]
+            if names:
+                res["researchers"] = names
+        return res
+
+    regex_parsed = _parse_notes(notes or "")
+    print(f"  Regex 파싱 - 날짜: {regex_parsed['date_start']}~{regex_parsed['date_end']}, "
+          f"기준: {regex_parsed['date_mode']}, 연구자: {regex_parsed['researchers']}")
+
     # ── AI에게 열 및 필터 결정 요청 ────────────────────────────────
     print("[extract_columns] AI 분석 중...")
     try:
         ai_result = ask_claude(notes, year, api_key)
-        columns           = ai_result.get("columns") or DEFAULT_COLUMNS
+        columns           = ai_result.get("columns") or []
         filter_mode       = ai_result.get("filter_mode", "both")
         filter_year       = ai_result.get("filter_year") or year
-        date_range        = ai_result.get("date_range")        # {"start": "YYYYMMDD", "end": "YYYYMMDD"} or None
-        researcher_filter = ai_result.get("researcher_filter") # list or None
+        date_range        = ai_result.get("date_range")
+        researcher_filter = ai_result.get("researcher_filter")
         ai_notes          = ai_result.get("notes", "")
         print(f"  AI 결정 - 열: {columns}, 필터: {filter_mode}, 연도: {filter_year}")
         print(f"  날짜범위: {date_range}, 연구자: {researcher_filter}")
         print(f"  AI 설명: {ai_notes}")
     except Exception as e:
         print(f"  AI 분석 실패 ({e}), 기본값 사용")
-        columns           = DEFAULT_COLUMNS
+        columns           = []
         filter_mode       = "both"
         filter_year       = year
         date_range        = None
         researcher_filter = None
         ai_notes          = "AI 분석 실패 → 기본 열 사용"
+
+    # Regex 결과로 AI 누락분 보완
+    if not date_range and regex_parsed["date_start"]:
+        date_range = {"start": regex_parsed["date_start"], "end": regex_parsed["date_end"]}
+    if not researcher_filter and regex_parsed["researchers"]:
+        researcher_filter = regex_parsed["researchers"]
+    if regex_parsed["date_mode"] != "both":
+        filter_mode = regex_parsed["date_mode"]
 
     # 추출 항목 미지정이면 전체 열(0~104) 사용
     if not columns:
