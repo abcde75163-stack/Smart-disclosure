@@ -113,6 +113,191 @@ TRANSFORMS = {
 }
 
 
+def run_free_format(all_rows, template_path, mapping, year, output_path):
+    """
+    연구자/교수 명단에서 이름 추출 → 해당 연구자의 기술이전 실적을 자유 양식으로 생성.
+    form_type='researcher_list'일 때 호출됨.
+    """
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+    # ── 연구자 명단 읽기 ──────────────────────────────────────────────
+    wb_form   = load_workbook(template_path, data_only=True)
+    res_sheet = mapping.get("researcher_sheet")
+    ws_form   = wb_form[res_sheet] if res_sheet and res_sheet in wb_form.sheetnames else wb_form.active
+
+    res_col   = mapping.get("researcher_col", 2)
+    res_start = mapping.get("researcher_data_start", 2)
+
+    researcher_names = []
+    for r in range(res_start, (ws_form.max_row or 0) + 1):
+        v = ws_form.cell(r, res_col).value
+        if v and str(v).strip():
+            name = str(v).strip()
+            if name and name not in researcher_names:
+                researcher_names.append(name)
+
+    print(f"  👥 명단에서 연구자 {len(researcher_names)}명 추출: {researcher_names[:5]}")
+
+    # ── 연구자 이름으로 마스터 DB 필터링 ────────────────────────────
+    def researcher_match(row):
+        investigator = str(row[29]).strip() if row[29] else ""
+        if not investigator:
+            return False
+        return any(
+            (len(name) >= 2) and (name in investigator or investigator in name)
+            for name in researcher_names
+        )
+
+    matched_all = [r for r in all_rows if researcher_match(r)]
+
+    # 연도 필터 시도 → 없으면 전체 기간
+    year_filtered = filter_by_year(matched_all, year, mode="both")
+    if year_filtered:
+        rows_to_use = year_filtered
+        year_label  = f"{year}년"
+    else:
+        rows_to_use = matched_all
+        year_label  = "전체 기간"
+        print(f"  ⚠️ {year}년 기준 결과 없음 → 전체 기간으로 확장")
+
+    print(f"  → 필터링 결과: {len(rows_to_use)}건 ({year_label})")
+
+    # ── 계약 단위로 집계 (동일 연번 입금 회차 합산) ─────────────────
+    contracts = {}
+    for row in rows_to_use:
+        seq = str(row[0]) if row[0] else ""
+        if not seq:
+            continue
+        payment = safe_int(row[76])
+        if seq not in contracts:
+            contracts[seq] = {"row": row, "total_pay": 0}
+        contracts[seq]["total_pay"] += payment
+
+    sorted_contracts = sorted(
+        contracts.values(),
+        key=lambda x: x["row"][1]
+        if isinstance(x["row"][1], (datetime.datetime, datetime.date))
+        else datetime.datetime(1900, 1, 1),
+    )
+
+    # ── 새 워크북 생성 ────────────────────────────────────────────────
+    wb_out = Workbook()
+    ws = wb_out.active
+    ws.title = "기술이전 실적"
+
+    thin = Side(style="thin", color="CCCCCC")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    header_fill  = PatternFill("solid", fgColor="1F3864")
+    header_font  = Font(bold=True, color="FFFFFF", size=10)
+    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    data_center = Alignment(horizontal="center", vertical="center")
+    data_left   = Alignment(horizontal="left", vertical="center", wrap_text=True)
+
+    headers = [
+        ("순번",                   6),
+        ("연구자명",               12),
+        ("기술명",                 30),
+        ("기술도입업체(지역)",     22),
+        ("계약일",                 12),
+        ("총기술료계약액\n(백만원)", 14),
+        (f"{year_label}\n입금액(백만원)", 14),
+        ("계약형태",               10),
+        ("중대형여부\n(1억 이상)", 10),
+    ]
+
+    # 제목 행 (1행)
+    title_cell = ws.cell(1, 1, f"기술이전 실적 현황 ({year_label})")
+    title_cell.font = Font(bold=True, size=12, color="1F3864")
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(headers))
+    title_cell.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 28
+
+    # 헤더 행 (2행)
+    ws.row_dimensions[2].height = 36
+    for c, (h, w) in enumerate(headers, 1):
+        cell = ws.cell(2, c, h)
+        cell.font  = header_font
+        cell.fill  = header_fill
+        cell.alignment = header_align
+        cell.border = border
+        ws.column_dimensions[cell.column_letter].width = w
+
+    # 데이터 행 (3행~)
+    total_income = 0
+    for idx, info in enumerate(sorted_contracts, 1):
+        row      = info["row"]
+        pay_total = info["total_pay"]
+        total_income += pay_total
+
+        company    = str(row[3]).strip() if row[3] else ""
+        is_foreign = str(row[6]).strip() in ("2", "국외")
+        region     = "해외" if is_foreign else get_region_name(row[8])
+        company_str = f"{company}({region})" if region else company
+
+        contract_m = round((safe_int(row[52]) + safe_int(row[50])) / 1_000_000, 1)
+        pay_m      = round(pay_total / 1_000_000, 1) if pay_total else None
+
+        row_num = idx + 2
+        ws.row_dimensions[row_num].height = 20
+
+        data_cells = [
+            (idx,                                        data_center),
+            (str(row[29]).strip() if row[29] else "",   data_center),
+            (str(row[28]).strip() if row[28] else "",   data_left),
+            (company_str,                                data_left),
+            (to_yyyymmdd(row[1]),                        data_center),
+            (contract_m if contract_m else None,         data_center),
+            (pay_m,                                      data_center),
+            (get_contract_type(row),                     data_center),
+            ("Y" if pay_total >= 100_000_000 else "N",  data_center),
+        ]
+        for c, (val, align) in enumerate(data_cells, 1):
+            cell = ws.cell(row_num, c, val)
+            cell.alignment = align
+            cell.border    = border
+            if c in (6, 7) and isinstance(val, float):
+                cell.number_format = "0.0"
+
+    # 합계 행
+    if sorted_contracts:
+        sum_row  = len(sorted_contracts) + 3
+        sum_fill = PatternFill("solid", fgColor="D6E4FF")
+        sum_font = Font(bold=True)
+        ws.row_dimensions[sum_row].height = 22
+        for c in range(1, len(headers) + 1):
+            cell = ws.cell(sum_row, c)
+            cell.fill      = sum_fill
+            cell.font      = sum_font
+            cell.border    = border
+            cell.alignment = data_center
+        ws.cell(sum_row, 1, "합계")
+        ws.cell(sum_row, 6).number_format = "0.0"
+        ws.cell(sum_row, 7).number_format = "0.0"
+        ws.cell(sum_row, 6, round(
+            sum(safe_int(i["row"][52]) + safe_int(i["row"][50]) for i in sorted_contracts) / 1_000_000, 1
+        ))
+        ws.cell(sum_row, 7, round(total_income / 1_000_000, 1) if total_income else None)
+
+    wb_out.save(output_path)
+    print(f"\n✅ 자유 양식 저장 완료: {output_path}")
+    print(f"   연구자 {len(researcher_names)}명 | 실적 {len(sorted_contracts)}건 | 총입금 {total_income:,}원")
+
+    return {
+        "count":            len(sorted_contracts),
+        "total_income":     total_income,
+        "mapping_notes":    f"연구자 명단 {len(researcher_names)}명 기준 자유 양식 추출 ({year_label})",
+        "manual_inputs":    [],
+        "filter_mode":      year_label,
+        "mapping":          mapping,
+        "cache_key":        None,
+        "form_type":        "researcher_list",
+        "researcher_count": len(researcher_names),
+    }
+
+
 def get_mapping_from_claude(template_analysis, db_columns_text, transform_rules_text, notes, year, hint, api_key=None, cached_mapping=None):
     """
     양식 파일 전체 내용을 AI에 전달하고 컬럼 매핑 JSON을 받아온다.
@@ -232,10 +417,31 @@ def get_mapping_from_claude(template_analysis, db_columns_text, transform_rules_
 
 ---
 
+## 특수 케이스: 연구자/교수 명단 파일
+양식 파일이 기술이전 성과를 기록하는 출력 양식이 아니라, **연구자·교수·인원 명단**(예: 교수님 명단, BK참여 명단, 담당자 리스트 등)으로 판단되면, 아래 형식으로만 응답하세요:
+
+```json
+{{
+  "form_type": "researcher_list",
+  "researcher_sheet": "연구자명이 있는 시트명",
+  "researcher_col": 2,
+  "researcher_data_start": 2,
+  "notes": "연구자 명단 파일로 감지됨. 해당 연구자들의 기술이전 실적을 자유 양식으로 추출."
+}}
+```
+- `researcher_col`: 연구자/교수명이 있는 열 번호(1-based)
+- `researcher_data_start`: 데이터가 시작되는 행 번호(헤더 다음 행)
+- 이 경우 columns 배열 불필요
+
+판단 기준: 시트에 BK참여, 교번, 임용일, 과학인등록번호 같은 인사 정보가 있고, 기술이전 실적 기재 열이 없으면 연구자 명단.
+
+---
+
 반드시 아래 JSON 형식으로만 응답하세요. 설명 없이 JSON 코드블록만 출력하세요.
 
 ```json
 {{
+  "form_type": "output_form",
   "target_sheet": "데이터를 채울 시트명",
   "data_start_row": 4,
   "filter_mode": "contract",
@@ -333,7 +539,16 @@ domestic_foreign, bridge_type
     if m:
         result = json.loads(m.group(1))
     else:
-        result = json.loads(text.strip())
+        # 순수 JSON 시도, 실패 시 {...} 블록 추출
+        raw = text.strip()
+        try:
+            result = json.loads(raw)
+        except json.JSONDecodeError:
+            m2 = re.search(r'\{[\s\S]*\}', raw)
+            if m2:
+                result = json.loads(m2.group())
+            else:
+                raise ValueError(f"AI 응답에서 JSON을 파싱할 수 없습니다. 응답 내용:\n{raw[:500]}")
 
     # 매핑 결과 로그 출력 (디버깅용)
     print(f"  📋 AI 매핑 결과:")
@@ -579,9 +794,15 @@ def run(master_path, template_path, year, output_path, notes="", hint="", api_ke
         template_analysis, db_columns_text, transform_rules_text,
         notes, year, hint, api_key, cached_mapping=cached_mapping
     )
-    print(f"  → 매핑 완료: {len(mapping.get('columns', []))}개 컬럼")
     if mapping.get("notes"):
         print(f"  ℹ️  {mapping['notes']}")
+
+    # ── 연구자 명단 특수 처리 ──────────────────────────────────────
+    if mapping.get("form_type") == "researcher_list":
+        print(f"  → 연구자 명단 파일 감지: 자유 양식 추출로 전환")
+        return run_free_format(all_rows, template_path, mapping, year, output_path)
+
+    print(f"  → 매핑 완료: {len(mapping.get('columns', []))}개 컬럼")
 
     # 필터링
     filter_mode = mapping.get("filter_mode", "both")
@@ -628,7 +849,9 @@ def run(master_path, template_path, year, output_path, notes="", hint="", api_ke
             print(f"   • {m}")
 
     print(f"\n📊 검토 결과 분석 중...")
-    raw_rows = [entry[0] if isinstance(entry, tuple) else entry for entry in rows_data]
+    # group_by=True면 (row, pay_amt, pay_year) 3-tuple에서 row만 추출
+    # group_by=False면 rows_data 자체가 row 리스트
+    raw_rows = [entry[0] for entry in rows_data] if group_by else list(rows_data)
     write_feedback_sheet(wb, raw_rows, year, "AI 자동 추출", total_income)
 
     wb.save(output_path)
