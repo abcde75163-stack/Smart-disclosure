@@ -3,7 +3,7 @@
 부산대학교 산학협력단 마스터 DB → 상위기관 보고 양식 자동 변환
 """
 import streamlit as st
-import tempfile, os, io, sys, traceback, re
+import tempfile, os, io, sys, traceback, re, json
 from pathlib import Path
 
 SCRIPTS_DIR = Path(__file__).parent / "scripts"
@@ -271,6 +271,31 @@ if run_btn and master_file and template_file:
 
                 with st.expander("📋 처리 상세 로그"):
                     st.code(log_output, language="text")
+
+                # ─── 캐시 저장 ───────────────────────────────────────
+                if result_info.get("mapping"):
+                    with st.expander("💾 이 매핑을 캐시에 저장하기 (다음번 동일 양식 정확도 향상)"):
+                        st.caption(
+                            "결과가 정확하다면 아래 JSON을 다운로드하고 "
+                            "GitHub의 `references/mapping_cache.json`에 덮어쓰기 하세요."
+                        )
+                        import sys as _sys
+                        _sys.path.insert(0, str(Path(__file__).parent / "scripts"))
+                        from extract_generic import load_cache, save_mapping_to_cache
+                        updated_cache = save_mapping_to_cache(
+                            template_file.name,
+                            result_info["mapping"],
+                            load_cache()
+                        )
+                        cache_json = json.dumps(updated_cache, ensure_ascii=False, indent=2)
+                        st.download_button(
+                            label="📥 mapping_cache.json 다운로드",
+                            data=cache_json.encode("utf-8"),
+                            file_name="mapping_cache.json",
+                            mime="application/json",
+                        )
+                        cache_key = result_info.get("cache_key", "")
+                        st.caption(f"저장 키: `{cache_key}`")
 
             else:
                 st.error("❌ 추출 중 오류가 발생했습니다.")

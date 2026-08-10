@@ -12,6 +12,60 @@ from feedback import write_feedback_sheet
 from analyze_template import analyze
 from openpyxl import load_workbook
 
+# ── 매핑 캐시 ──────────────────────────────────────────────────────
+_CACHE_PATH = os.path.join(os.path.dirname(__file__), "..", "references", "mapping_cache.json")
+
+def _normalize_key(filename: str) -> str:
+    """파일명 → 캐시 조회용 정규화 키."""
+    name = os.path.splitext(os.path.basename(filename))[0].lower()
+    for w in ["자동추출", "수정안내", "복사본", "최종", "수정", "제출용", "붙임", "별첨"]:
+        name = name.replace(w, "")
+    name = re.sub(r'20\d{2}', '', name)          # 연도 제거
+    name = re.sub(r'\d{4,}', '', name)            # 긴 숫자 제거
+    name = re.sub(r'[\s_\-\(\)\[\]\.]+', ' ', name).strip()
+    return name
+
+def load_cache() -> dict:
+    try:
+        with open(_CACHE_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def find_cached_mapping(template_filename: str, cache: dict) -> tuple:
+    """파일명으로 캐시에서 가장 유사한 매핑 탐색. (key, mapping) 또는 (None, None)."""
+    key = _normalize_key(template_filename)
+    best_key, best_mapping, best_score = None, None, 0
+    for cache_key, entry in cache.items():
+        if cache_key.startswith("_"):
+            continue
+        mapping = entry.get("mapping") if isinstance(entry, dict) else None
+        if not mapping:
+            continue
+        # 부분 문자열 매칭 점수
+        score = 0
+        for part in cache_key.split():
+            if part and part in key:
+                score += len(part)
+        for part in key.split():
+            if part and part in cache_key:
+                score += len(part)
+        if score > best_score:
+            best_score, best_key, best_mapping = score, cache_key, mapping
+    if best_score >= 4:   # 최소 4자 이상 겹쳐야 매칭으로 인정
+        return best_key, best_mapping
+    return None, None
+
+def save_mapping_to_cache(template_filename: str, mapping: dict, cache: dict) -> dict:
+    """추출 성공 후 매핑을 캐시에 추가."""
+    key = _normalize_key(template_filename)
+    cache[key] = {
+        "saved_at": datetime.datetime.now().strftime("%Y-%m-%d"),
+        "template_hint": template_filename,
+        "mapping": mapping,
+    }
+    return cache
+
 # ── 지원 transform 함수 ────────────────────────────────────────────
 TRANSFORMS = {
     "str":               lambda row, idx: str(row[idx]) if row[idx] is not None else "",
@@ -30,9 +84,10 @@ TRANSFORMS = {
 }
 
 
-def get_mapping_from_claude(template_analysis, db_columns_text, transform_rules_text, notes, year, hint, api_key=None):
+def get_mapping_from_claude(template_analysis, db_columns_text, transform_rules_text, notes, year, hint, api_key=None, cached_mapping=None):
     """
     양식 파일 전체 내용을 AI에 전달하고 컬럼 매핑 JSON을 받아온다.
+    cached_mapping: 유사 양식에서 성공한 이전 매핑 (참고용으로 프롬프트에 주입)
     """
     try:
         import anthropic
@@ -68,6 +123,15 @@ def get_mapping_from_claude(template_analysis, db_columns_text, transform_rules_
             form_text_parts.append("  (이하 행 생략)")
     form_full_text = "\n".join(form_text_parts)
 
+    if cached_mapping:
+        cached_section = (
+            "이전에 유사한 양식에서 성공적으로 사용된 매핑입니다. "
+            "현재 양식의 헤더와 지침을 우선하되, 구조가 비슷하면 참고하세요.\n"
+            f"```json\n{json.dumps(cached_mapping, ensure_ascii=False, indent=2)}\n```"
+        )
+    else:
+        cached_section = "(없음 — 처음 보는 양식이므로 양식 파일 지침만 따르세요)"
+
     prompt = f"""당신은 기술이전 데이터 추출 전문가입니다.
 
 아래에 제공된 양식 파일의 전체 내용을 읽고, 그 안에 있는 작성 지침과 예시를 따라 컬럼 매핑 JSON을 생성해주세요.
@@ -80,6 +144,9 @@ def get_mapping_from_claude(template_analysis, db_columns_text, transform_rules_
 
 ## 추출 연도
 {year}년
+
+## 이전 유사 양식의 성공 매핑 (참고용)
+{cached_section}
 
 ## 양식 파일 전체 내용
 {form_full_text}
@@ -450,10 +517,18 @@ def run(master_path, template_path, year, output_path, notes="", hint="", api_ke
     with open(os.path.join(ref_dir, "transform_rules.md"), encoding="utf-8") as f:
         transform_rules_text = f.read()
 
+    # 캐시 조회
+    cache = load_cache()
+    cache_key, cached_mapping = find_cached_mapping(os.path.basename(template_path), cache)
+    if cache_key:
+        print(f"  📦 캐시 히트: '{cache_key}' 매핑을 참고 예시로 사용")
+    else:
+        print(f"  📦 캐시 없음: AI가 양식을 처음부터 분석합니다")
+
     print(f"🤖 AI가 양식 지침을 분석하고 매핑 중... (10~30초 소요)")
     mapping = get_mapping_from_claude(
         template_analysis, db_columns_text, transform_rules_text,
-        notes, year, hint, api_key
+        notes, year, hint, api_key, cached_mapping=cached_mapping
     )
     print(f"  → 매핑 완료: {len(mapping.get('columns', []))}개 컬럼")
     if mapping.get("notes"):
@@ -519,4 +594,6 @@ def run(master_path, template_path, year, output_path, notes="", hint="", api_ke
         "mapping_notes": mapping.get("notes", ""),
         "manual_inputs": manual,
         "filter_mode": filter_mode,
+        "mapping": mapping,          # 캐시 저장용
+        "cache_key": _normalize_key(os.path.basename(template_path)),
     }
