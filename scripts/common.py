@@ -175,7 +175,18 @@ def load_master_db(path):
     """마스터 DB 전체 행 로드 (헤더 제외)"""
     from openpyxl import load_workbook
     wb = load_workbook(path, read_only=True, data_only=True)
-    ws = wb["내역"]
+
+    # 시트명 우선순위: "내역" → 유사 이름 → 첫 번째 시트
+    if "내역" in wb.sheetnames:
+        ws = wb["내역"]
+    else:
+        candidates = [s for s in wb.sheetnames if "내역" in s or "기술이전" in s or "DB" in s.upper()]
+        if candidates:
+            ws = wb[candidates[0]]
+            print(f"  ⚠️  '내역' 시트 없음 → '{candidates[0]}' 시트 사용")
+        else:
+            ws = wb[wb.sheetnames[0]]
+            print(f"  ⚠️  '내역' 시트 없음 → 첫 번째 시트 '{wb.sheetnames[0]}' 사용")
     rows = []
     for i, row in enumerate(ws.iter_rows(values_only=True)):
         if i == 0: continue   # 헤더 스킵
