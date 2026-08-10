@@ -56,15 +56,44 @@ def find_cached_mapping(template_filename: str, cache: dict) -> tuple:
         return best_key, best_mapping
     return None, None
 
-def save_mapping_to_cache(template_filename: str, mapping: dict, cache: dict) -> dict:
-    """추출 성공 후 매핑을 캐시에 추가."""
+def save_mapping_to_cache(template_filename: str, mapping: dict, cache: dict,
+                          example_rows: list = None) -> dict:
+    """추출 성공 후 매핑(+수동 검증 예시 행)을 캐시에 추가."""
     key = _normalize_key(template_filename)
-    cache[key] = {
+    entry = cache.get(key, {})
+    entry.update({
         "saved_at": datetime.datetime.now().strftime("%Y-%m-%d"),
         "template_hint": template_filename,
         "mapping": mapping,
-    }
+    })
+    if example_rows is not None:
+        entry["example_rows"] = example_rows   # 수동 검증된 올바른 출력 행
+    cache[key] = entry
     return cache
+
+
+def extract_example_rows(corrected_file_bytes: bytes, target_sheet: str = None,
+                          data_start: int = 4, n_rows: int = 5) -> list:
+    """수정된 결과 파일에서 헤더 + 데이터 예시 행 추출."""
+    import io
+    wb = load_workbook(io.BytesIO(corrected_file_bytes), data_only=True)
+    ws = None
+    if target_sheet and target_sheet in wb.sheetnames:
+        ws = wb[target_sheet]
+    else:
+        ws = wb.active
+
+    header_row = data_start - 1
+    rows_out = []
+    for r in range(header_row, min(header_row + n_rows + 1, (ws.max_row or 0) + 1)):
+        cells = {}
+        for c in range(1, (ws.max_column or 0) + 1):
+            v = ws.cell(r, c).value
+            if v is not None and str(v).strip():
+                cells[str(c)] = str(v).strip()
+        if cells:
+            rows_out.append({"row": r, "cells": cells, "is_header": r == header_row})
+    return rows_out
 
 # ── 지원 transform 함수 ────────────────────────────────────────────
 TRANSFORMS = {
@@ -129,6 +158,26 @@ def get_mapping_from_claude(template_analysis, db_columns_text, transform_rules_
             "현재 양식의 헤더와 지침을 우선하되, 구조가 비슷하면 참고하세요.\n"
             f"```json\n{json.dumps(cached_mapping, ensure_ascii=False, indent=2)}\n```"
         )
+        # 수동 검증된 예시 행이 있으면 추가
+        example_rows = None
+        if cached_mapping:
+            cache = load_cache()
+            key = _normalize_key(template_analysis.get("_filename", ""))
+            _, found_mapping = find_cached_mapping(template_analysis.get("_filename", ""), cache)
+            for ck, ce in cache.items():
+                if isinstance(ce, dict) and ce.get("mapping") == cached_mapping:
+                    example_rows = ce.get("example_rows")
+                    break
+        if example_rows:
+            rows_text = []
+            for row_info in example_rows:
+                tag = "헤더" if row_info.get("is_header") else "데이터"
+                cells_str = ", ".join(f"[열{k}]{v}" for k, v in row_info["cells"].items())
+                rows_text.append(f"  {tag}행{row_info['row']}: {cells_str}")
+            cached_section += (
+                "\n\n### 수동 검증된 올바른 출력 예시 (이 형식을 정확히 따르세요)\n"
+                + "\n".join(rows_text)
+            )
     else:
         cached_section = "(없음 — 처음 보는 양식이므로 양식 파일 지침만 따르세요)"
 

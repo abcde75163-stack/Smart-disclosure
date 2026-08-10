@@ -273,29 +273,56 @@ if run_btn and master_file and template_file:
                     st.code(log_output, language="text")
 
                 # ─── 캐시 저장 ───────────────────────────────────────
-                if result_info.get("mapping"):
-                    with st.expander("💾 이 매핑을 캐시에 저장하기 (다음번 동일 양식 정확도 향상)"):
-                        st.caption(
-                            "결과가 정확하다면 아래 JSON을 다운로드하고 "
-                            "GitHub의 `references/mapping_cache.json`에 덮어쓰기 하세요."
-                        )
-                        import sys as _sys
-                        _sys.path.insert(0, str(Path(__file__).parent / "scripts"))
-                        from extract_generic import load_cache, save_mapping_to_cache
-                        updated_cache = save_mapping_to_cache(
-                            template_file.name,
-                            result_info["mapping"],
-                            load_cache()
-                        )
-                        cache_json = json.dumps(updated_cache, ensure_ascii=False, indent=2)
-                        st.download_button(
-                            label="📥 mapping_cache.json 다운로드",
-                            data=cache_json.encode("utf-8"),
-                            file_name="mapping_cache.json",
-                            mime="application/json",
-                        )
-                        cache_key = result_info.get("cache_key", "")
-                        st.caption(f"저장 키: `{cache_key}`")
+                st.markdown("---")
+                st.markdown("#### 💾 캐시 업데이트")
+                st.caption("결과를 검토 후 수정한 파일을 올리면 다음번 동일 양식 추출 정확도가 올라갑니다.")
+
+                corrected_file = st.file_uploader(
+                    "✏️ 수동 수정된 결과 파일 업로드 (선택)",
+                    type=["xlsx"],
+                    key="corrected",
+                    help="다운로드한 파일에서 틀린 부분을 고친 뒤 여기에 올려주세요."
+                )
+
+                if corrected_file and result_info.get("mapping"):
+                    from extract_generic import (
+                        load_cache, save_mapping_to_cache, extract_example_rows
+                    )
+                    target_sheet = result_info["mapping"].get("target_sheet")
+                    data_start   = result_info["mapping"].get("data_start_row", 4)
+                    example_rows = extract_example_rows(
+                        corrected_file.getvalue(), target_sheet, data_start, n_rows=5
+                    )
+                    updated_cache = save_mapping_to_cache(
+                        template_file.name,
+                        result_info["mapping"],
+                        load_cache(),
+                        example_rows=example_rows,
+                    )
+                    cache_json = json.dumps(updated_cache, ensure_ascii=False, indent=2)
+
+                    st.success(f"✅ 수정 파일에서 예시 {len(example_rows)}행 추출 완료!")
+                    st.caption("아래 파일을 다운로드하고 GitHub의 `references/mapping_cache.json`에 덮어쓰기 하세요.")
+                    st.download_button(
+                        label="📥 mapping_cache.json 다운로드",
+                        data=cache_json.encode("utf-8"),
+                        file_name="mapping_cache.json",
+                        mime="application/json",
+                        use_container_width=True,
+                    )
+                elif result_info.get("mapping"):
+                    from extract_generic import load_cache, save_mapping_to_cache
+                    updated_cache = save_mapping_to_cache(
+                        template_file.name, result_info["mapping"], load_cache()
+                    )
+                    cache_json = json.dumps(updated_cache, ensure_ascii=False, indent=2)
+                    st.download_button(
+                        label="📥 수정 없이 현재 매핑만 캐시 저장",
+                        data=cache_json.encode("utf-8"),
+                        file_name="mapping_cache.json",
+                        mime="application/json",
+                        use_container_width=True,
+                    )
 
             else:
                 st.error("❌ 추출 중 오류가 발생했습니다.")
