@@ -12,6 +12,41 @@ from feedback import write_feedback_sheet
 from analyze_template import analyze
 from openpyxl import load_workbook
 
+
+def parse_notes_filters(notes: str) -> dict:
+    """
+    추가 요청사항 텍스트에서 날짜 범위·필터 기준·연구자 목록을 파싱.
+    반환: {"date_start": "YYYYMMDD"|None, "date_end": "YYYYMMDD"|None,
+           "date_mode": "contract"|"payment"|"both",
+           "researchers": [이름,...] | None}
+    """
+    result = {"date_start": None, "date_end": None,
+              "date_mode": "both", "researchers": None}
+    if not notes:
+        return result
+
+    # 날짜 범위: 20260101~20260801 / 20260101-20260801 / 20260101 ~ 20260801
+    m = re.search(r'(20\d{6})\s*[~\-~]\s*(20\d{6})', notes)
+    if m:
+        result["date_start"] = m.group(1)
+        result["date_end"]   = m.group(2)
+
+    # 필터 기준
+    if "계약일" in notes:
+        result["date_mode"] = "contract"
+    elif "입금일" in notes:
+        result["date_mode"] = "payment"
+
+    # 연구자 목록: "대상 연구자: 홍길동, 김철수" 또는 "연구자: ..."
+    rm = re.search(r'(?:대상\s*)?연구자\s*[:：]\s*(.+)', notes)
+    if rm:
+        names_raw = rm.group(1).strip()
+        names = [n.strip() for n in re.split(r'[,，/\n]', names_raw) if n.strip()]
+        if names:
+            result["researchers"] = names
+
+    return result
+
 # ── 매핑 캐시 ──────────────────────────────────────────────────────
 _CACHE_PATH = os.path.join(os.path.dirname(__file__), "..", "references", "mapping_cache.json")
 
@@ -804,10 +839,32 @@ def run(master_path, template_path, year, output_path, notes="", hint="", api_ke
 
     print(f"  → 매핑 완료: {len(mapping.get('columns', []))}개 컬럼")
 
-    # 필터링
-    filter_mode = mapping.get("filter_mode", "both")
-    filtered = filter_by_year(all_rows, year, mode=filter_mode)
-    print(f"  → {year}년 해당 행: {len(filtered)}건 (기준: {filter_mode})")
+    # ── notes에서 날짜 범위·연구자 파싱 ─────────────────────────────
+    notes_filters = parse_notes_filters(notes)
+
+    # 필터링 (날짜 범위 우선, 없으면 연도 전체)
+    filter_mode = notes_filters["date_mode"] if notes_filters["date_start"] \
+                  else mapping.get("filter_mode", "both")
+
+    if notes_filters["date_start"] and notes_filters["date_end"]:
+        from extract_columns import filter_by_date_range
+        filtered = filter_by_date_range(
+            all_rows,
+            notes_filters["date_start"], notes_filters["date_end"],
+            contract_col=1, payment_col=73, mode=filter_mode
+        )
+        print(f"  → 날짜범위 필터 {notes_filters['date_start']}~{notes_filters['date_end']} ({filter_mode}): {len(filtered)}건")
+    else:
+        filtered = filter_by_year(all_rows, year, mode=filter_mode)
+        print(f"  → {year}년 해당 행: {len(filtered)}건 (기준: {filter_mode})")
+
+    # 연구자 필터
+    if notes_filters["researchers"]:
+        from extract_columns import filter_by_researchers
+        before = len(filtered)
+        filtered = filter_by_researchers(filtered, notes_filters["researchers"],
+                                         inventor_col=29, co_inventor_col=33)
+        print(f"  → 연구자 필터 {notes_filters['researchers']}: {before}건 → {len(filtered)}건")
 
     if mapping.get("exclude_consulting", True):
         filtered = [r for r in filtered if get_bridge_type(r[37], r[44]) is not None]
