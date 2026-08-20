@@ -121,6 +121,69 @@ def wants_column_extract_mode(notes: str, request_files) -> bool:
     return any(keyword in text for keyword in no_form_keywords)
 
 
+def _format_filter_mode(mode: str) -> str:
+    return {
+        "contract": "계약일 기준",
+        "payment": "입금일 기준",
+        "both": "계약일 또는 입금일 기준",
+        "none": "날짜 필터 없음",
+    }.get(mode or "", mode or "-")
+
+
+def render_understanding(result_info: dict, no_template_mode: bool):
+    understanding = result_info.get("understanding") or {}
+    if not understanding:
+        return
+
+    with st.expander("🔎 AI가 이해한 요청 내용", expanded=True):
+        st.write({
+            "처리 모드": understanding.get("mode", "서식 없음 / 요청 항목 직접 추출" if no_template_mode else "서식 파일 채우기"),
+            "요청파일": understanding.get("request_files", []),
+            "필터 기준": _format_filter_mode(understanding.get("filter_mode")),
+            "기간": understanding.get("date_range") or understanding.get("filter_year") or "-",
+            "대상자/참고값 필터": len(understanding.get("reference_filters") or []),
+            "추가 DB 조건": len(understanding.get("db_filters") or []),
+        })
+        if not no_template_mode:
+            st.write({
+                "최종 작성양식": understanding.get("output_file_name", "-"),
+                "대상 시트": understanding.get("target_sheet", "-"),
+                "입력 시작 행": understanding.get("data_start_row", "-"),
+                "계약 단위 집계": bool(understanding.get("group_by_contract")),
+                "기술자문 제외": bool(understanding.get("exclude_consulting")),
+            })
+
+
+def render_column_validation(result_info: dict, no_template_mode: bool):
+    rows = result_info.get("column_validation") or []
+    if not rows:
+        return
+
+    title = "✅ 요청 항목 매칭 검증" if no_template_mode else "✅ 양식 컬럼 매핑 검증"
+    with st.expander(title, expanded=no_template_mode):
+        if no_template_mode:
+            st.caption("요청사항에서 추출하기로 판단한 항목과 마스터 DB 컬럼입니다.")
+        else:
+            st.caption("AI가 양식의 출력 열을 어떤 DB 값으로 채우려 했는지 확인합니다.")
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+
+
+def render_zero_result_report(result_info: dict):
+    if result_info.get("count", 0) != 0:
+        return
+
+    st.warning("⚠️ 추출 결과가 0건입니다. 아래 단계별 건수 변화를 확인해주세요.")
+    reasons = result_info.get("zero_result_reasons") or []
+    if reasons:
+        for reason in reasons:
+            st.markdown(f"• {reason}")
+
+    diagnostics = result_info.get("diagnostics") or []
+    if diagnostics:
+        with st.expander("📉 0건 원인 상세"):
+            st.dataframe(diagnostics, use_container_width=True, hide_index=True)
+
+
 # ─── 헤더 ────────────────────────────────────────────────────────
 st.markdown('<p class="app-title">🔬 기술이전 성과 자동 추출</p>', unsafe_allow_html=True)
 st.markdown(
@@ -304,6 +367,10 @@ if run_btn and master_file:
                     c3.metric("연구자 수", f"{result_info.get('researcher_count', 0)}명")
                 else:
                     c3.metric("필터 기준", filter_mode or "-")
+
+                render_understanding(result_info, no_template_mode)
+                render_column_validation(result_info, no_template_mode)
+                render_zero_result_report(result_info)
 
                 # no_template_mode: AI 분석 노트
                 if no_template_mode and result_info.get("ai_notes"):
