@@ -118,6 +118,14 @@ def infer_requested_columns(notes: str) -> list:
     return found
 
 
+def describe_columns(columns: list) -> list:
+    """화면 검증용 컬럼 설명."""
+    return [
+        {"db_index": db_idx, "header": HEADER_MAP.get(db_idx, f"col_{db_idx}")}
+        for db_idx in columns
+    ]
+
+
 def ask_openai(notes: str, year: int, api_key: str) -> dict:
     """
     추가 요청사항을 분석해서 추출할 열과 필터 조건을 반환.
@@ -505,6 +513,7 @@ def run(master_path: str, year: int, output_path: str,
     request_file_paths = request_file_paths or []
     request_file_names = request_file_names or []
     print(f"  전체 행수: {len(all_rows)}")
+    diagnostics = [{"step": "마스터 DB 로딩", "before": None, "after": len(all_rows)}]
 
     # ── 마스터 DB 유효성 검증 ────────────────────────────────────────
     if all_rows and len(all_rows[0]) < 50:
@@ -603,16 +612,29 @@ def run(master_path: str, year: int, output_path: str,
     if date_range and date_range.get("start") and date_range.get("end"):
         start_d = date_range["start"]
         end_d   = date_range["end"]
+        before = len(all_rows)
         rows = filter_by_date_range(all_rows, start_d, end_d,
                                     contract_col=1, payment_col=73, mode=filter_mode)
         print(f"  날짜범위 필터 {start_d}~{end_d} ({filter_mode}) → {len(rows)}행")
+        diagnostics.append({
+            "step": f"날짜범위 필터 {start_d}~{end_d} ({filter_mode})",
+            "before": before,
+            "after": len(rows),
+        })
     elif filter_mode == "none":
         rows = all_rows
         print(f"  필터 없음 → {len(rows)}행")
+        diagnostics.append({"step": "필터 없음", "before": len(all_rows), "after": len(rows)})
     else:
+        before = len(all_rows)
         rows = filter_by_year(all_rows, filter_year,
                               contract_col=1, payment_col=73, mode=filter_mode)
         print(f"  {filter_year}년 필터({filter_mode}) → {len(rows)}행")
+        diagnostics.append({
+            "step": f"{filter_year}년 필터({filter_mode})",
+            "before": before,
+            "after": len(rows),
+        })
 
     # ── 연구자 필터링 ────────────────────────────────────────────────
     if researcher_filter:
@@ -620,14 +642,31 @@ def run(master_path: str, year: int, output_path: str,
         rows = filter_by_researchers(rows, researcher_filter,
                                      inventor_col=29, co_inventor_col=33)
         print(f"  연구자 필터 {researcher_filter} → {before}행 → {len(rows)}행")
+        diagnostics.append({
+            "step": f"연구자 필터 {researcher_filter}",
+            "before": before,
+            "after": len(rows),
+        })
 
     if not reference_filters:
         reference_filters = infer_reference_filters(request_file_paths, notes)
     if reference_filters:
+        before = len(rows)
         rows = apply_reference_filters(rows, request_file_paths, reference_filters)
+        diagnostics.append({
+            "step": "요청파일 대상자/참고값 필터",
+            "before": before,
+            "after": len(rows),
+        })
 
     if db_filters:
+        before = len(rows)
         rows = apply_db_filters(rows, db_filters)
+        diagnostics.append({
+            "step": f"추가 DB 조건 필터 {len(db_filters)}개",
+            "before": before,
+            "after": len(rows),
+        })
 
     # ── Excel 출력 ──────────────────────────────────────────────────
     wb = Workbook()
@@ -686,12 +725,37 @@ def run(master_path: str, year: int, output_path: str,
 
     wb.save(output_path)
     print(f"[extract_columns] 저장 완료: {output_path} ({len(rows)}건)")
+    zero_reasons = []
+    if not rows:
+        for item in diagnostics:
+            before = item.get("before")
+            after = item.get("after")
+            if before and after == 0:
+                zero_reasons.append(
+                    f"{item.get('step')} 단계에서 {before}건이 0건으로 줄었습니다."
+                )
+        if not zero_reasons:
+            zero_reasons.append("마스터 DB 또는 적용 조건에서 일치하는 행을 찾지 못했습니다.")
 
     return {
         "count": len(rows),
         "columns": columns,
+        "column_validation": describe_columns(columns),
         "total_income": total_income,
         "filter_mode": filter_mode,
         "filter_year": filter_year,
         "ai_notes": ai_notes,
+        "understanding": {
+            "mode": "서식 없음 / 요청 항목 직접 추출",
+            "request_files": request_file_names,
+            "columns": describe_columns(columns),
+            "date_range": date_range,
+            "filter_mode": filter_mode,
+            "filter_year": filter_year,
+            "researcher_filter": researcher_filter,
+            "reference_filters": reference_filters,
+            "db_filters": db_filters,
+        },
+        "diagnostics": diagnostics,
+        "zero_result_reasons": zero_reasons,
     }
