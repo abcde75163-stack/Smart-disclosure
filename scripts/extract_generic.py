@@ -1324,6 +1324,7 @@ def run(master_path, template_path, year, output_path, notes="", hint="", api_ke
         request_file_paths=None, request_file_names=None):
     print(f"📂 마스터 DB 로딩: {master_path}")
     all_rows = load_master_db(master_path)
+    diagnostics = [{"step": "마스터 DB 로딩", "before": None, "after": len(all_rows)}]
     request_file_paths = request_file_paths or [template_path]
     request_file_names = request_file_names or [os.path.basename(p) for p in request_file_paths]
 
@@ -1459,15 +1460,27 @@ def run(master_path, template_path, year, output_path, notes="", hint="", api_ke
         from extract_columns import filter_by_date_range
         start_d = effective_date_range["start"]
         end_d = effective_date_range["end"]
+        before = len(all_rows)
         filtered = filter_by_date_range(
             all_rows,
             start_d, end_d,
             contract_col=1, payment_col=73, mode=filter_mode
         )
         print(f"  → 날짜범위 필터 {start_d}~{end_d} ({filter_mode}): {len(filtered)}건")
+        diagnostics.append({
+            "step": f"날짜범위 필터 {start_d}~{end_d} ({filter_mode})",
+            "before": before,
+            "after": len(filtered),
+        })
     else:
+        before = len(all_rows)
         filtered = filter_by_year(all_rows, year, mode=filter_mode)
         print(f"  → {year}년 해당 행: {len(filtered)}건 (기준: {filter_mode})")
+        diagnostics.append({
+            "step": f"{year}년 필터({filter_mode})",
+            "before": before,
+            "after": len(filtered),
+        })
 
     # 연구자 필터
     if notes_filters["researchers"]:
@@ -1476,26 +1489,54 @@ def run(master_path, template_path, year, output_path, notes="", hint="", api_ke
         filtered = filter_by_researchers(filtered, notes_filters["researchers"],
                                          inventor_col=29, co_inventor_col=33)
         print(f"  → 연구자 필터 {notes_filters['researchers']}: {before}건 → {len(filtered)}건")
+        diagnostics.append({
+            "step": f"연구자 필터 {notes_filters['researchers']}",
+            "before": before,
+            "after": len(filtered),
+        })
 
     reference_filters = mapping.get("reference_filters") or []
     if not reference_filters:
         reference_filters = infer_reference_filters(request_file_paths, notes)
     if reference_filters:
+        before = len(filtered)
         filtered = apply_reference_filters(filtered, request_file_paths, reference_filters)
+        diagnostics.append({
+            "step": "요청파일 대상자/참고값 필터",
+            "before": before,
+            "after": len(filtered),
+        })
 
     db_filters = mapping.get("db_filters") or []
     if db_filters:
+        before = len(filtered)
         filtered = apply_db_filters(filtered, db_filters)
+        diagnostics.append({
+            "step": f"추가 DB 조건 필터 {len(db_filters)}개",
+            "before": before,
+            "after": len(filtered),
+        })
 
     if mapping.get("exclude_consulting", True):
+        before = len(filtered)
         filtered = [r for r in filtered if get_bridge_type(r[37], r[44]) is not None]
         print(f"  → 기술자문 제외 후: {len(filtered)}건")
+        diagnostics.append({
+            "step": "기술자문 제외",
+            "before": before,
+            "after": len(filtered),
+        })
 
     # 집계 방식 결정
     group_by = mapping.get("group_by_contract", False)
     if group_by:
         rows_data = aggregate_by_contract(filtered, year)
         print(f"  → 계약 집계 후: {len(rows_data)}건")
+        diagnostics.append({
+            "step": "계약 단위 집계",
+            "before": len(filtered),
+            "after": len(rows_data),
+        })
     else:
         # 계약일 기준 정렬
         filtered.sort(key=lambda r: r[1] if isinstance(r[1], (datetime.datetime, datetime.date))
@@ -1536,6 +1577,29 @@ def run(master_path, template_path, year, output_path, notes="", hint="", api_ke
     print(f"\n✅ 저장 완료: {output_path}")
     print(f"   총 {count}건 | 총수입: {total_income:,}원")
     print(f"📋 검토 결과 시트에서 이상 데이터를 확인하세요.")
+    zero_reasons = []
+    if count == 0:
+        for item in diagnostics:
+            before = item.get("before")
+            after = item.get("after")
+            if before and after == 0:
+                zero_reasons.append(
+                    f"{item.get('step')} 단계에서 {before}건이 0건으로 줄었습니다."
+                )
+        if not zero_reasons:
+            zero_reasons.append("마스터 DB 또는 적용 조건에서 일치하는 행을 찾지 못했습니다.")
+
+    column_validation = []
+    for item in mapping.get("columns", []):
+        if not isinstance(item, dict):
+            continue
+        column_validation.append({
+            "output_col": item.get("col"),
+            "label": item.get("label", ""),
+            "type": item.get("type", ""),
+            "db_index": item.get("db_index"),
+            "confidence": item.get("confidence"),
+        })
 
     return {
         "count": count,
@@ -1547,4 +1611,21 @@ def run(master_path, template_path, year, output_path, notes="", hint="", api_ke
         "cache_key": _normalize_key(os.path.basename(output_template_path)),
         "mapping_quality": final_mapping_validation,
         "output_file_index": output_file_index,
+        "understanding": {
+            "mode": "서식 파일 채우기",
+            "request_files": request_file_names,
+            "output_file_index": output_file_index,
+            "output_file_name": request_file_names[output_file_index - 1],
+            "target_sheet": ws.title,
+            "data_start_row": data_start,
+            "filter_mode": filter_mode,
+            "date_range": effective_date_range,
+            "reference_filters": reference_filters,
+            "db_filters": db_filters,
+            "group_by_contract": group_by,
+            "exclude_consulting": mapping.get("exclude_consulting", True),
+        },
+        "column_validation": column_validation,
+        "diagnostics": diagnostics,
+        "zero_result_reasons": zero_reasons,
     }
