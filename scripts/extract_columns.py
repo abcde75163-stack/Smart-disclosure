@@ -80,6 +80,43 @@ HEADER_MAP = {
 # 기본 추출 열 (요청사항이 없거나 불명확할 때)
 DEFAULT_COLUMNS = [0, 1, 3, 28, 29, 37, 44, 50, 52, 73, 76]
 
+REQUEST_COLUMN_ALIASES = [
+    ("계약일", 1),
+    ("기술이전계약일", 1),
+    ("업체명", 3),
+    ("기관(업체)명", 3),
+    ("사업자등록번호", 9),
+    ("기술명", 28),
+    ("발명자명", 29),
+    ("주발명자", 29),
+    ("성명", 29),
+    ("교직원번호", 30),
+    ("교번", 30),
+    ("학과", 31),
+    ("소속", 31),
+    ("기술유형", 37),
+    ("지식재산권", 38),
+    ("거래유형", 44),
+    ("정액기술료", 52),
+    ("계약금액", 52),
+    ("계약입금일", 73),
+    ("입금일", 73),
+    ("현금입금액", 76),
+    ("입금액", 76),
+    ("경상기술료", 82),
+    ("정액기술료입금", 83),
+]
+
+
+def infer_requested_columns(notes: str) -> list:
+    """AI가 열 목록을 놓쳤을 때 요청 문장에 적힌 항목 순서대로 컬럼을 추정."""
+    text = notes or ""
+    found = []
+    for keyword, db_index in REQUEST_COLUMN_ALIASES:
+        if keyword in text and db_index not in found:
+            found.append(db_index)
+    return found
+
 
 def ask_openai(notes: str, year: int, api_key: str) -> dict:
     """
@@ -91,6 +128,7 @@ def ask_openai(notes: str, year: int, api_key: str) -> dict:
       "filter_year": 2025,
       "date_range": {"start": "YYYYMMDD", "end": "YYYYMMDD"} 또는 null,
       "researcher_filter": ["이름1", "이름2", ...] 또는 null,
+      "reference_filters": [{"source_file_index": 1, "column": 2, "db_indices": [30, 34]}],
       "db_filters": [{"db_index": 76, "operator": "gte", "value": 100000000, "value_type": "number"}],
       "notes": "분석 설명"
     }
@@ -113,6 +151,17 @@ def ask_openai(notes: str, year: int, api_key: str) -> dict:
   "filter_year": 연도_정수_또는_null,
   "date_range": {{"start": "YYYYMMDD", "end": "YYYYMMDD"}} 또는 null,
   "researcher_filter": ["이름1", "이름2"] 또는 null,
+  "reference_filters": [
+    {{
+      "source_file_index": 1,
+      "sheet": "평가명단",
+      "column": 2,
+      "data_start_row": 2,
+      "db_indices": [30, 34],
+      "match_type": "contains",
+      "label": "교직원번호"
+    }}
+  ],
   "db_filters": [
     {{
       "db_index": 76,
@@ -131,6 +180,12 @@ def ask_openai(notes: str, year: int, api_key: str) -> dict:
 - filter_year: 요청에 다른 연도가 있으면 그 연도, 없으면 null (기준 연도 {year} 사용)
 - date_range: "X월Y일~X월Y일", "YYYY년MM월DD일부터" 등 구체적 날짜 범위가 있으면 YYYYMMDD 형식으로 변환. 없으면 null
 - researcher_filter: 특정 연구자/발명자 이름 목록이 있으면 배열로 추출. 없으면 null
+- reference_filters: 요청파일이 명단/대상 파일이고 "동일 대상", "명단 기준" 같은 요청이 있으면 사용. 없으면 빈 배열 [].
+  - source_file_index: 요청파일 번호(1부터 시작)
+  - column: 요청파일에서 대상값이 있는 열 번호(1-based)
+  - data_start_row: 대상값 시작 행
+  - db_indices: 마스터 DB에서 비교할 컬럼. 교직원번호 [30,34], 연구자명/발명자명 [29,33], 사업자등록번호 [9], 업체명 [3], 기술명 [28]
+  - match_type: exact 또는 contains
 - db_filters: 자연어 요청에 마스터 DB 조건이 있으면 구조화. 없으면 빈 배열 [].
   - operator: eq, neq, in, not_in, contains, not_contains, gt, gte, lt, lte, between, date_between, year_eq, is_empty, not_empty
   - value_type: text, number, date, auto
@@ -139,8 +194,8 @@ def ask_openai(notes: str, year: int, api_key: str) -> dict:
   - 예: "기술자문 제외" → db_index 44 / not_in / ["9", "기술자문"] / text
   - 예: "계약일 20260101~20260630" → db_index 1 / date_between / ["20260101", "20260630"] / date
 - 추출 항목이 명시되지 않으면 columns는 빈 배열 [] 로 반환 (전체 열 추출로 처리됨)
-- 추출 항목이 명시된 경우에만 해당 db_index 목록을 반환
-- 열 순서는 db_index 오름차순으로 정렬
+- 추출 항목이 명시된 경우에는 사용자가 요청한 항목만 columns에 넣으세요. 기본 컬럼을 추가하지 마세요.
+- 열 순서는 사용자가 적은 요청 항목 순서를 최대한 유지하세요.
 - columns에는 중복 없이 정수만"""
 
     return create_json_response(
@@ -315,6 +370,112 @@ def apply_db_filters(rows, db_filters):
     return filtered
 
 
+def _extract_reference_values(reference_path, reference_filter):
+    from openpyxl import load_workbook
+    sheet_name = reference_filter.get("sheet")
+    col = int(reference_filter.get("column") or 0)
+    start_row = int(reference_filter.get("data_start_row") or 2)
+    if col < 1:
+        return []
+
+    wb = load_workbook(reference_path, data_only=True, read_only=True)
+    ws = wb[sheet_name] if sheet_name and sheet_name in wb.sheetnames else wb.active
+    values = []
+    seen = set()
+    for r in range(start_row, (ws.max_row or 0) + 1):
+        value = _norm_match_value(ws.cell(r, col).value)
+        if value and value not in seen:
+            values.append(value)
+            seen.add(value)
+    wb.close()
+    return values
+
+
+def infer_reference_filters(request_file_paths, notes=""):
+    if not request_file_paths:
+        return []
+    wants_reference_filter = any(k in (notes or "") for k in ["동일", "대상", "명단", "교직원", "교번", "연구자", "교수"])
+    if not wants_reference_filter:
+        return []
+
+    from openpyxl import load_workbook
+    for file_index, path in enumerate(request_file_paths, 1):
+        wb = load_workbook(path, data_only=True, read_only=True)
+        for ws in wb.worksheets:
+            for r in range(1, min(ws.max_row or 0, 10) + 1):
+                for c in range(1, (ws.max_column or 0) + 1):
+                    header = ws.cell(r, c).value
+                    if not header:
+                        continue
+                    header_text = str(header).replace("\n", " ").strip()
+                    if any(k in header_text for k in ["교직원", "교번", "직원번호", "사번"]):
+                        wb.close()
+                        return [{
+                            "source_file_index": file_index,
+                            "sheet": ws.title,
+                            "column": c,
+                            "data_start_row": r + 1,
+                            "db_indices": [30, 34],
+                            "match_type": "contains",
+                            "label": header_text,
+                        }]
+                    if any(k in header_text for k in ["연구자", "교수", "성명", "이름", "발명자"]):
+                        wb.close()
+                        return [{
+                            "source_file_index": file_index,
+                            "sheet": ws.title,
+                            "column": c,
+                            "data_start_row": r + 1,
+                            "db_indices": [29, 33],
+                            "match_type": "contains",
+                            "label": header_text,
+                        }]
+        wb.close()
+    return []
+
+
+def apply_reference_filters(rows, request_file_paths, reference_filters):
+    if not request_file_paths or not reference_filters:
+        return rows
+    filtered = rows
+    for reference_filter in reference_filters:
+        source_index = int(reference_filter.get("source_file_index") or 1)
+        if source_index < 1 or source_index > len(request_file_paths):
+            continue
+        values = set(_extract_reference_values(request_file_paths[source_index - 1], reference_filter))
+        db_indices = []
+        for db_idx in reference_filter.get("db_indices") or []:
+            try:
+                db_indices.append(int(db_idx))
+            except Exception:
+                pass
+        if not values or not db_indices:
+            continue
+
+        before = len(filtered)
+        match_type = reference_filter.get("match_type", "contains")
+
+        def matches(row):
+            for db_idx in db_indices:
+                if db_idx >= len(row):
+                    continue
+                cell_value = _norm_match_value(row[db_idx])
+                if not cell_value:
+                    continue
+                if match_type == "exact" and cell_value in values:
+                    return True
+                if match_type != "exact" and any(v in cell_value or cell_value in v for v in values):
+                    return True
+            return False
+
+        filtered = [row for row in filtered if matches(row)]
+        print(
+            f"  요청파일 대상 필터 '{reference_filter.get('label', '')}' "
+            f"→ {len(values)}개 값 / {before}행 → {len(filtered)}행"
+        )
+    return filtered
+
+
 def format_cell_value(value, db_index: int):
     """셀 값 표시용 포맷."""
     if value is None:
@@ -334,13 +495,15 @@ def format_cell_value(value, db_index: int):
 
 
 def run(master_path: str, year: int, output_path: str,
-        notes: str, api_key: str) -> dict:
+        notes: str, api_key: str, request_file_paths=None, request_file_names=None) -> dict:
     """
     메인 실행 함수.
     반환: {"count": N, "columns": [...], "total_income": N, "ai_notes": "..."}
     """
     print(f"[extract_columns] 마스터 DB 로딩: {master_path}")
     all_rows = load_master_db(master_path)
+    request_file_paths = request_file_paths or []
+    request_file_names = request_file_names or []
     print(f"  전체 행수: {len(all_rows)}")
 
     # ── 마스터 DB 유효성 검증 ────────────────────────────────────────
@@ -395,6 +558,7 @@ def run(master_path: str, year: int, output_path: str,
         filter_year       = ai_result.get("filter_year") or year
         date_range        = ai_result.get("date_range")
         researcher_filter = ai_result.get("researcher_filter")
+        reference_filters = ai_result.get("reference_filters") or []
         db_filters        = ai_result.get("db_filters") or []
         ai_notes          = ai_result.get("notes", "")
         print(f"  AI 결정 - 열: {columns}, 필터: {filter_mode}, 연도: {filter_year}")
@@ -407,6 +571,7 @@ def run(master_path: str, year: int, output_path: str,
         filter_year       = year
         date_range        = None
         researcher_filter = None
+        reference_filters = []
         db_filters        = []
         ai_notes          = "AI 분석 실패 → 기본 열 사용"
 
@@ -418,12 +583,21 @@ def run(master_path: str, year: int, output_path: str,
     if regex_parsed["date_mode"] != "both":
         filter_mode = regex_parsed["date_mode"]
 
+    inferred_columns = infer_requested_columns(notes or "")
+    if not columns and inferred_columns:
+        columns = inferred_columns
+        print(f"  요청사항 키워드 기반 열 보완 → {columns}")
+
     # 추출 항목 미지정이면 전체 열(0~104) 사용
     if not columns:
         columns = list(range(105))
         print("  추출 항목 미지정 → 전체 열(0~104) 추출")
     else:
-        columns = sorted(set(c for c in columns if 0 <= c <= 104))
+        deduped = []
+        for c in columns:
+            if isinstance(c, int) and 0 <= c <= 104 and c not in deduped:
+                deduped.append(c)
+        columns = deduped
 
     # ── 날짜 필터링 ─────────────────────────────────────────────────
     if date_range and date_range.get("start") and date_range.get("end"):
@@ -446,6 +620,11 @@ def run(master_path: str, year: int, output_path: str,
         rows = filter_by_researchers(rows, researcher_filter,
                                      inventor_col=29, co_inventor_col=33)
         print(f"  연구자 필터 {researcher_filter} → {before}행 → {len(rows)}행")
+
+    if not reference_filters:
+        reference_filters = infer_reference_filters(request_file_paths, notes)
+    if reference_filters:
+        rows = apply_reference_filters(rows, request_file_paths, reference_filters)
 
     if db_filters:
         rows = apply_db_filters(rows, db_filters)
