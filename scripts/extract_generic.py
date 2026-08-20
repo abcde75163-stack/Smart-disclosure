@@ -32,6 +32,17 @@ def parse_notes_filters(notes: str) -> dict:
     if m:
         result["date_start"] = m.group(1)
         result["date_end"]   = m.group(2)
+    else:
+        # 날짜 범위: 2023. 3. 1. ~ 2026. 2. 28. / 2023-03-01 ~ 2026-02-28
+        m = re.search(
+            r'(20\d{2})\s*[.\-/년]\s*(\d{1,2})\s*[.\-/월]\s*(\d{1,2})\s*(?:[.일])?\s*[~\-–]\s*'
+            r'(20\d{2})\s*[.\-/년]\s*(\d{1,2})\s*[.\-/월]\s*(\d{1,2})\s*(?:[.일])?',
+            notes,
+        )
+        if m:
+            y1, mo1, d1, y2, mo2, d2 = m.groups()
+            result["date_start"] = f"{int(y1):04d}{int(mo1):02d}{int(d1):02d}"
+            result["date_end"] = f"{int(y2):04d}{int(mo2):02d}{int(d2):02d}"
 
     # 필터 기준
     if "계약일" in notes:
@@ -48,6 +59,26 @@ def parse_notes_filters(notes: str) -> dict:
             result["researchers"] = names
 
     return result
+
+
+def infer_date_range_from_analysis(template_analysis):
+    """양식 제목/작성요령에서 보이는 기간 문구를 날짜 범위로 추정."""
+    chunks = []
+    for sheet in template_analysis.get("sheets", []):
+        for row_info in sheet.get("rows", []):
+            for value in row_info.get("cells", {}).values():
+                if value:
+                    chunks.append(str(value))
+    text = "\n".join(chunks[:300])
+    parsed = parse_notes_filters(text)
+    if parsed.get("date_start") and parsed.get("date_end"):
+        return {
+            "start": parsed["date_start"],
+            "end": parsed["date_end"],
+            "mode": parsed.get("date_mode") or "contract",
+            "source": "template_text",
+        }
+    return None
 
 # ── 매핑 캐시 ──────────────────────────────────────────────────────
 _CACHE_PATH = os.path.join(os.path.dirname(__file__), "..", "references", "mapping_cache.json")
@@ -701,6 +732,7 @@ def get_mapping_from_openai(template_analysis, db_columns_text, transform_rules_
 - 작성요령 파일이 따로 있으면 인정기준, 제외대상, 기간 기준, 단위 규칙을 매핑에 반영하세요.
 - 추출대상자 명단 파일이 따로 있고 사용자가 "동일한 대상", "명단 기준", "교직원번호 기준" 등을 요청하면 `reference_filters`에 대상 필터를 작성하세요.
 - 사용자가 자연어로 마스터 DB 조건을 말하면 `db_filters`에 구조화하세요. 예: "입금액 1억원 이상", "부처명이 교육부", "기술자문 제외", "업체명에 바이오 포함", "계약일 20260101~20260630".
+- 작성양식 제목이나 작성요령에 "2023. 3. 1. ~ 2026. 2. 28."처럼 명시된 실적 인정기간이 있으면 단순 파일명 연도보다 그 기간을 우선해서 `date_range`에 넣으세요.
 - 헤더에 "(백만원)"이라고 쓰여 있으면 백만원 단위로, "(YYYYMMDD)"이면 8자리 날짜로, "(Yes/No)"이면 Y/N으로 변환하세요.
 - 예시 행(XX대학교, 홍길동 등)의 형식을 정확히 따르세요. 예) "XX대학교(홍길동)" 형식이면 "부산대학교(연구자명)" 형식으로.
 - 작성 지침에 인정기준이 있으면 그에 맞게 필터 조건을 설정하세요.
@@ -779,6 +811,7 @@ def get_mapping_from_openai(template_analysis, db_columns_text, transform_rules_
   "target_sheet": "데이터를 채울 시트명",
   "data_start_row": 4,
   "filter_mode": "contract",
+  "date_range": {{"start": "20230301", "end": "20260228", "mode": "contract"}},
   "exclude_consulting": true,
   "group_by_contract": false,
   "reference_filters": [
@@ -890,6 +923,12 @@ domestic_foreign, bridge_type
 - "both": 계약일 또는 입금일이 해당 연도 (BRIDGE 방식)
 - "contract": 계약일 기준
 - "payment": 입금일 기준
+
+## date_range
+- 양식 또는 작성요령에 실적 인정기간이 명시되어 있으면 사용하세요.
+- `start`, `end`는 YYYYMMDD 형식입니다.
+- `mode`는 contract, payment, both 중 하나입니다. 기술이전 계약일 기준이면 contract를 사용하세요.
+- date_range가 있으면 파일명에서 감지한 단일 연도 필터보다 우선 적용됩니다.
 
 ## group_by_contract
 - true: 동일 연번(계약)의 여러 입금 회차를 1행으로 집계 (TLO 방식)
@@ -1378,21 +1417,54 @@ def run(master_path, template_path, year, output_path, notes="", hint="", api_ke
     if mapping_validation.get("issues"):
         print(f"  ⚠️ 매핑 검증 잔여 이슈: {len(mapping_validation['issues'])}건")
 
+    inferred_template_date_range = None
+    for analysis in request_analyses:
+        inferred_template_date_range = infer_date_range_from_analysis(analysis)
+        if inferred_template_date_range:
+            print(
+                "  → 양식 내 기간 감지: "
+                f"{inferred_template_date_range['start']}~{inferred_template_date_range['end']}"
+            )
+            break
+
     # ── notes에서 날짜 범위·연구자 파싱 ─────────────────────────────
     notes_filters = parse_notes_filters(notes)
+    mapping_date_range = mapping.get("date_range") or {}
+    if isinstance(mapping_date_range, dict) and mapping_date_range.get("start") and mapping_date_range.get("end"):
+        mapping_date_range = {
+            "start": str(mapping_date_range.get("start")),
+            "end": str(mapping_date_range.get("end")),
+            "mode": mapping_date_range.get("mode") or mapping.get("filter_mode", "both"),
+        }
+    else:
+        mapping_date_range = None
 
     # 필터링 (날짜 범위 우선, 없으면 연도 전체)
-    filter_mode = notes_filters["date_mode"] if notes_filters["date_start"] \
+    effective_date_range = None
+    if notes_filters["date_start"] and notes_filters["date_end"]:
+        effective_date_range = {
+            "start": notes_filters["date_start"],
+            "end": notes_filters["date_end"],
+            "mode": notes_filters["date_mode"],
+        }
+    elif mapping_date_range:
+        effective_date_range = mapping_date_range
+    elif inferred_template_date_range:
+        effective_date_range = inferred_template_date_range
+
+    filter_mode = effective_date_range.get("mode") if effective_date_range \
                   else mapping.get("filter_mode", "both")
 
-    if notes_filters["date_start"] and notes_filters["date_end"]:
+    if effective_date_range:
         from extract_columns import filter_by_date_range
+        start_d = effective_date_range["start"]
+        end_d = effective_date_range["end"]
         filtered = filter_by_date_range(
             all_rows,
-            notes_filters["date_start"], notes_filters["date_end"],
+            start_d, end_d,
             contract_col=1, payment_col=73, mode=filter_mode
         )
-        print(f"  → 날짜범위 필터 {notes_filters['date_start']}~{notes_filters['date_end']} ({filter_mode}): {len(filtered)}건")
+        print(f"  → 날짜범위 필터 {start_d}~{end_d} ({filter_mode}): {len(filtered)}건")
     else:
         filtered = filter_by_year(all_rows, year, mode=filter_mode)
         print(f"  → {year}년 해당 행: {len(filtered)}건 (기준: {filter_mode})")
