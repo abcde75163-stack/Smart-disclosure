@@ -112,6 +112,15 @@ def detect_year(master_name: str, request_names=None) -> int:
     return datetime.datetime.now().year
 
 
+def wants_column_extract_mode(notes: str, request_files) -> bool:
+    """True이면 요청파일은 서식이 아니라 참고/대상 파일로 보고 요청 항목만 추출."""
+    text = (notes or "").replace(" ", "")
+    if not request_files:
+        return True
+    no_form_keywords = ["서식없", "양식없", "요청한항목", "적어놓은항목", "아래항목", "항목만", "열만"]
+    return any(keyword in text for keyword in no_form_keywords)
+
+
 # ─── 헤더 ────────────────────────────────────────────────────────
 st.markdown('<p class="app-title">🔬 기술이전 성과 자동 추출</p>', unsafe_allow_html=True)
 st.markdown(
@@ -165,13 +174,21 @@ with col_r:
 st.markdown("---")
 
 # ─── 추가 요청사항 ────────────────────────────────────────────────
+st.markdown(
+    """
+    <div style="font-size:0.82rem; color:#4B5563; line-height:1.55; margin-bottom:0.45rem;">
+      <b>작성 예시</b><br>
+      • <b>서식이 있는 경우:</b> 요청파일 1은 대상자 명단이고, 요청파일 2는 작성요령, 요청파일 3은 최종 작성양식이야. 요청파일 1의 교직원번호와 동일한 대상만 요청파일 3 양식에 맞게 추출해줘.<br>
+      • <b>서식이 없는 경우:</b> 서식 없음. 요청파일 1의 교직원 명단에 대해서 기술이전계약일 2024~2026년 성과를 계약일, 기술명, 발명자명, 학과, 정액기술료, 계약입금일만 추출해줘.
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 notes = st.text_area(
     "💬 추가 요청사항 (선택)",
     placeholder=(
-        "예시)\n"
-        "요청파일 1은 대상자 명단이고, 요청파일 2는 작성요령, 요청파일 3은 최종 작성양식이야.\n"
-        "요청파일 1의 교직원번호와 동일한 대상만 마스터 DB에서 찾아서 요청파일 3 양식에 맞게 추출해줘.\n"
-        "작성요령의 인정 기준을 따르고, 기간은 2026년 계약일 기준으로 해줘."
+        "여기에 자연어로 요청사항을 입력하세요.\n"
+        "예: 서식 없음. 요청파일 1의 교직원 명단 기준으로 계약일, 기술명, 발명자명만 추출해줘."
     ),
     height=130,
 )
@@ -199,7 +216,7 @@ if not master_file:
 if run_btn and master_file:
     request_names = [f.name for f in request_files] if request_files else []
     year = detect_year(master_file.name, request_names)
-    no_template_mode = not request_files
+    no_template_mode = wants_column_extract_mode(notes, request_files)
 
     spinner_msg = (
         f"⏳ 추가 요청사항을 분석하고 {year}년 데이터를 추출하고 있습니다... (10~20초)"
@@ -236,7 +253,9 @@ if run_btn and master_file:
                 if no_template_mode:
                     from extract_columns import run as run_columns
                     result_info = run_columns(
-                        master_path, year, output_path, notes, api_key
+                        master_path, year, output_path, notes, api_key,
+                        request_file_paths=request_paths,
+                        request_file_names=request_names,
                     )
                 else:
                     from extract_generic import run as run_generic
@@ -269,7 +288,6 @@ if run_btn and master_file:
                     st.success(f"✅ 연구자 {researcher_count}명 기술이전 실적 추출 완료!")
                 else:
                     st.success(f"✅ 추출 완료! ({year}년 기준)")
-                st.balloons()
 
                 # 결과 요약
                 count     = result_info.get("count", 0)
