@@ -361,6 +361,16 @@ def run(master_path: str, year: int, output_path: str,
         if m:
             res["date_start"] = m.group(1)
             res["date_end"]   = m.group(2)
+        else:
+            m = _re.search(
+                r'(20\d{2})\s*[.\-/년]\s*(\d{1,2})\s*[.\-/월]\s*(\d{1,2})\s*(?:[.일])?\s*[~\-–]\s*'
+                r'(20\d{2})\s*[.\-/년]\s*(\d{1,2})\s*[.\-/월]\s*(\d{1,2})\s*(?:[.일])?',
+                text,
+            )
+            if m:
+                y1, mo1, d1, y2, mo2, d2 = m.groups()
+                res["date_start"] = f"{int(y1):04d}{int(mo1):02d}{int(d1):02d}"
+                res["date_end"] = f"{int(y2):04d}{int(mo2):02d}{int(d2):02d}"
         if "계약일" in text:
             res["date_mode"] = "contract"
         elif "입금일" in text:
