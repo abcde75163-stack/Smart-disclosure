@@ -932,7 +932,7 @@ domestic_foreign, bridge_type
             "너는 기술이전 마스터 DB와 제출 양식 사이의 컬럼 매핑을 설계하는 전문가다. "
             "반드시 유효한 JSON 객체만 출력한다."
         ),
-        max_output_tokens=4000,
+        max_output_tokens=10000,
     )
 
     # 매핑 결과 로그 출력 (디버깅용)
