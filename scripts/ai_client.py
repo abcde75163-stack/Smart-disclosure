@@ -24,12 +24,36 @@ def get_fallback_model() -> str:
 
 
 def strip_json_fence(text: str) -> str:
-    text = text.strip()
+    text = (text or "").strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
         text = re.sub(r"\s*```$", "", text)
     match = re.search(r"\{[\s\S]*\}", text)
     return match.group(0) if match else text
+
+
+def repair_common_json_errors(text: str) -> str:
+    """Repair small JSON formatting mistakes that sometimes appear in model output."""
+    repaired = text.strip()
+    repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
+    repaired = re.sub(r"([}\]])\s*\n\s*([{[])", r"\1,\n\2", repaired)
+    repaired = re.sub(
+        r'([}\]"0-9]|true|false|null)\s*\n\s*("([^"\\]|\\.)+"\s*:)',
+        r"\1,\n\2",
+        repaired,
+    )
+    return repaired
+
+
+def parse_json_text(text: str) -> dict:
+    cleaned = strip_json_fence(text)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        repaired = repair_common_json_errors(cleaned)
+        if repaired != cleaned:
+            return json.loads(repaired)
+        raise
 
 
 def extract_response_text(response) -> str:
@@ -74,6 +98,7 @@ def create_json_response(api_key: str, prompt: str, instructions: str, max_outpu
     model = get_model()
     fallback_model = get_fallback_model()
     output_tokens = min(max(max_output_tokens, 4000), MAX_JSON_TOKENS)
+    original_prompt = prompt
 
     for attempt in range(MAX_RETRIES):
         try:
@@ -92,24 +117,39 @@ def create_json_response(api_key: str, prompt: str, instructions: str, max_outpu
                     time.sleep(RETRY_BASE_DELAY * (2**attempt))
                     continue
                 raise ValueError(
-                    "AI 응답이 비어 있습니다. 출력 토큰 부족 또는 응답 중단 가능성이 있습니다. "
+                    "AI 응답이 비어 있습니다. 출력 토큰 제한 또는 응답 중단 가능성이 있습니다. "
                     f"{state}"
                 )
-            return json.loads(strip_json_fence(text))
+
+            try:
+                return parse_json_text(text)
+            except json.JSONDecodeError as error:
+                if attempt < MAX_RETRIES - 1:
+                    prompt = (
+                        "The previous answer was invalid JSON. Return the same result again as one valid JSON object only. "
+                        "Do not omit commas between object properties or array items. Do not add markdown fences.\n\n"
+                        "Original task:\n"
+                        f"{original_prompt}\n\n"
+                        "Invalid previous answer excerpt:\n"
+                        f"{text[:6000]}"
+                    )
+                    time.sleep(RETRY_BASE_DELAY * (2**attempt))
+                    continue
+                preview = text[:1000]
+                raise ValueError(
+                    f"AI 응답을 JSON으로 파싱할 수 없습니다: {error}\n"
+                    f"응답 앞부분: {preview!r}"
+                ) from error
         except BadRequestError as error:
             if fallback_model and is_capacity_error(error) and model != fallback_model:
                 model = fallback_model
+                prompt = original_prompt
                 continue
             raise
-        except json.JSONDecodeError as error:
-            preview = text[:1000] if "text" in locals() else ""
-            raise ValueError(
-                f"AI 응답을 JSON으로 파싱할 수 없습니다: {error}\n"
-                f"응답 앞부분: {preview!r}"
-            ) from error
         except Exception as error:
             if fallback_model and is_capacity_error(error) and model != fallback_model:
                 model = fallback_model
+                prompt = original_prompt
                 continue
             if not is_transient_error(error) or attempt == MAX_RETRIES - 1:
                 raise
