@@ -164,7 +164,8 @@ def analyze_extraction(data_rows, year, format_name):
 
 
 # ── 피드백 시트 작성 ───────────────────────────────────────────
-def write_feedback_sheet(wb, data_rows, year, format_name, total_income=0, mapping_quality=None):
+def write_feedback_sheet(wb, data_rows, year, format_name, total_income=0,
+                         mapping_quality=None, extraction_feedback=None):
     """
     워크북에 '검토 결과' 시트를 추가하고 피드백을 기록한다.
     wb: 이미 열려 있는 openpyxl Workbook
@@ -255,6 +256,53 @@ def write_feedback_sheet(wb, data_rows, year, format_name, total_income=0, mappi
         _write(ws, row, 2, reason, 'warn')
         row += 1
     row += 1
+
+    # ── 3-0. 결과 파일 내용 기반 자동 피드백 ────────────────────────
+    if extraction_feedback:
+        ws.merge_cells(f'A{row}:H{row}')
+        _write(ws, row, 1, '3-0. 결과 파일 내용 기반 자동 피드백', 'section')
+        ws.row_dimensions[row].height = 18
+        row += 1
+
+        _write(ws, row, 1, '구분', 'header')
+        _write(ws, row, 2, '항목', 'header')
+        _write(ws, row, 3, '건수', 'header')
+        ws.merge_cells(f'D{row}:H{row}')
+        _write(ws, row, 4, '내용', 'header')
+        row += 1
+
+        fix_counts = extraction_feedback.get('fix_counts') or {}
+        if fix_counts:
+            for item, count in fix_counts.items():
+                _write(ws, row, 1, '자동 보강', 'good')
+                _write(ws, row, 2, item, 'good')
+                _write(ws, row, 3, count, 'number')
+                ws.merge_cells(f'D{row}:H{row}')
+                _write(ws, row, 4, '원본 DB 값을 바탕으로 결과 시트에 자동 입력했습니다.', 'good')
+                row += 1
+        else:
+            _write(ws, row, 1, '자동 보강', 'normal')
+            _write(ws, row, 2, '-', 'normal')
+            _write(ws, row, 3, 0, 'number')
+            ws.merge_cells(f'D{row}:H{row}')
+            _write(ws, row, 4, '추가로 자동 보강한 항목은 없습니다.', 'normal')
+            row += 1
+
+        for item in extraction_feedback.get('remaining_blanks') or []:
+            _write(ws, row, 1, '확인 필요', 'warn')
+            _write(ws, row, 2, item.get('item', ''), 'warn')
+            _write(ws, row, 3, item.get('blank', 0), 'number')
+            ws.merge_cells(f'D{row}:H{row}')
+            _write(ws, row, 4, item.get('note', ''), 'warn')
+            row += 1
+
+        for note in extraction_feedback.get('notes') or []:
+            _write(ws, row, 1, '적용 기준', 'normal')
+            ws.merge_cells(f'B{row}:H{row}')
+            _write(ws, row, 2, note, 'normal')
+            row += 1
+
+        row += 1
 
     # ── 3-1. AI 매핑 신뢰도 / 자동 검증 결과 ─────────────────────
     if mapping_quality:
