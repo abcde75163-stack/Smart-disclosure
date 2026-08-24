@@ -1034,6 +1034,175 @@ def aggregate_by_contract(rows, year):
     return result
 
 
+def _norm_header(value):
+    return re.sub(r"\s+", "", str(value or "")).strip()
+
+
+def _get_effective_header(ws, col, data_start):
+    parts = []
+    for row in range(1, data_start):
+        value = ws.cell(row, col).value
+        if value not in (None, ""):
+            parts.append(str(value).replace("\n", " ").strip())
+    return " ".join(parts)
+
+
+def _find_output_col(ws, data_start, keywords):
+    for col in range(1, (ws.max_column or 0) + 1):
+        header = _norm_header(_get_effective_header(ws, col, data_start))
+        if all(keyword in header for keyword in keywords):
+            return col
+    return None
+
+
+def _is_kiat_trade_sheet(ws, data_start):
+    headers = [_norm_header(_get_effective_header(ws, col, data_start)) for col in range(1, (ws.max_column or 0) + 1)]
+    joined = " ".join(headers)
+    return "기술거래실적" in ws.title or ("국내거래中유형" in joined and "NTB등록기술" in joined)
+
+
+def _month_diff_inclusive(start, end):
+    if not isinstance(start, (datetime.datetime, datetime.date)) or not isinstance(end, (datetime.datetime, datetime.date)):
+        return None
+    months = (end.year - start.year) * 12 + (end.month - start.month) + 1
+    return months if months > 0 else None
+
+
+def _format_fee_method(value):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if "경상" in text:
+        return "경상기술료"
+    if "선급" in text or "착수" in text:
+        return "선불/착수금"
+    if "정액" in text:
+        return "정액기술료"
+    return text
+
+
+def _format_kiat_tech_type(value):
+    text = str(value or "").strip()
+    if "특허" in text:
+        return "특허"
+    if "노하우" in text or "정보" in text:
+        return "정보 및 노하우"
+    return text or None
+
+
+def _format_kiat_domestic_type(row):
+    domestic = str(row[6] or "").strip()
+    if domestic in ("2", "국외", "국제", "해외"):
+        return None
+    return "공공→민간"
+
+
+def _format_kiat_ntb_flag(value):
+    text = str(value or "").strip()
+    if not text:
+        return "무"
+    if text in ("Y", "y", "유", "등록", "등록기술", "1", "O", "o"):
+        return "유"
+    if text in ("N", "n", "무", "미등록", "0", "X", "x"):
+        return "무"
+    return text
+
+
+def postprocess_kiat_trade_sheet(ws, rows_data, data_start, group_by_contract):
+    """KIAT 기술거래실적 양식에서 AI가 놓치기 쉬운 반복 항목을 규칙 기반으로 보강."""
+    if not _is_kiat_trade_sheet(ws, data_start):
+        return None
+
+    col_map = {
+        "tech_type": _find_output_col(ws, data_start, ["기술유형"]),
+        "included_count": _find_output_col(ws, data_start, ["포함", "기술수"]),
+        "domestic_type": _find_output_col(ws, data_start, ["국내거래中유형"]),
+        "contract_period": _find_output_col(ws, data_start, ["계약기간"]),
+        "fee_method": _find_output_col(ws, data_start, ["기술료수취방법"]),
+        "gov_flag": _find_output_col(ws, data_start, ["정부과제수행", "유무"]),
+        "gov_project": _find_output_col(ws, data_start, ["거래관련정부지원과제명"]),
+        "ntb_flag": _find_output_col(ws, data_start, ["NTB등록기술", "이전여부"]),
+        "ntb_number": _find_output_col(ws, data_start, ["NTB등록번호"]),
+    }
+
+    fixes = []
+    for row_idx, row_entry in enumerate(rows_data, 1):
+        excel_row = data_start + row_idx - 1
+        row = row_entry[0] if group_by_contract else row_entry
+
+        def set_if_blank(key, value, label):
+            col = col_map.get(key)
+            if not col or value in (None, ""):
+                return
+            cell = ws.cell(excel_row, col)
+            if cell.value in (None, "") or (key == "included_count" and cell.value == 0):
+                cell.value = value
+                fixes.append(label)
+
+        tech_type_col = col_map.get("tech_type")
+        tech_type_value = _format_kiat_tech_type(row[37] if len(row) > 37 else None)
+        if tech_type_col and tech_type_value:
+            cell = ws.cell(excel_row, tech_type_col)
+            if cell.value != tech_type_value:
+                cell.value = tech_type_value
+                fixes.append("기술유형")
+
+        included = safe_int(row[40] if len(row) > 40 else 0)
+        if included <= 0:
+            included = 1
+        set_if_blank("included_count", included, "포함된 기술수")
+
+        set_if_blank("domestic_type", _format_kiat_domestic_type(row), "국내 거래 中 유형")
+
+        months = _month_diff_inclusive(row[46] if len(row) > 46 else None, row[47] if len(row) > 47 else None)
+        period_value = months if months else "없음"
+        set_if_blank("contract_period", period_value, "계약기간")
+
+        set_if_blank("fee_method", _format_fee_method(row[49] if len(row) > 49 else None), "기술료 수취방법")
+
+        project_name = row[56] if len(row) > 56 else None
+        set_if_blank("gov_flag", "유" if project_name not in (None, "") else "무", "정부과제 수행유무")
+        set_if_blank("gov_project", project_name, "정부지원 과제명")
+
+        set_if_blank("ntb_flag", _format_kiat_ntb_flag(row[98] if len(row) > 98 else None), "NTB 등록기술 이전여부")
+
+    data_row_count = len(rows_data)
+    remaining_blanks = []
+    important = {
+        "domestic_type": "국내 거래 中 유형",
+        "contract_period": "계약기간",
+        "fee_method": "기술료 수취방법",
+        "gov_flag": "정부과제 수행유무",
+        "ntb_flag": "NTB 등록기술 이전여부",
+    }
+    for key, label in important.items():
+        col = col_map.get(key)
+        if not col:
+            remaining_blanks.append({"item": label, "blank": data_row_count, "note": "대상 열을 찾지 못했습니다."})
+            continue
+        blank = 0
+        for row in range(data_start, data_start + data_row_count):
+            if ws.cell(row, col).value in (None, ""):
+                blank += 1
+        if blank:
+            remaining_blanks.append({"item": label, "blank": blank, "note": "일부 행 확인 필요"})
+
+    fix_counts = {}
+    for label in fixes:
+        fix_counts[label] = fix_counts.get(label, 0) + 1
+
+    return {
+        "title": "KIAT 기술거래실적 양식 자동 보강 결과",
+        "fix_counts": fix_counts,
+        "remaining_blanks": remaining_blanks,
+        "notes": [
+            "계약기간은 계약시작일~계약종료일을 월 단위로 계산했습니다.",
+            "국내 거래 中 유형은 공공기관 기술제공 기준으로 공공→민간을 기본 적용했습니다.",
+            "NTB 등록기술 이전여부는 원본 NTB등록여부 값이 없으면 무로 보강했습니다.",
+        ],
+    }
+
+
 def patch_missing_columns(mapping, ws, db_columns_text, data_start):
     """
     AI가 헤더 열을 누락했을 때 db_columns.md 키워드로 자동 보완.
@@ -1555,6 +1724,10 @@ def run(master_path, template_path, year, output_path, notes="", hint="", api_ke
 
     print(f"📝 데이터 채우기 중... (시트: {ws.title}, {data_start}행부터)")
     total_income = apply_mapping(ws, rows_data, mapping, data_start, group_by, year)
+    extraction_feedback = postprocess_kiat_trade_sheet(ws, rows_data, data_start, group_by)
+    if extraction_feedback:
+        fixed_total = sum(extraction_feedback.get("fix_counts", {}).values())
+        print(f"  🔧 KIAT 양식 후처리 보강: {fixed_total}개 셀")
 
     # 수동 입력 필요 안내
     manual = mapping.get("manual_inputs", [])
@@ -1570,6 +1743,7 @@ def run(master_path, template_path, year, output_path, notes="", hint="", api_ke
     write_feedback_sheet(
         wb, raw_rows, year, "AI 자동 추출", total_income,
         mapping_quality=final_mapping_validation,
+        extraction_feedback=extraction_feedback,
     )
 
     wb.save(output_path)
