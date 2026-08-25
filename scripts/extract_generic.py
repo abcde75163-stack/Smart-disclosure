@@ -15,6 +15,67 @@ from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 
 
+SPREADSHEET_EXTENSIONS = (".xlsx", ".xlsm", ".xltx", ".xls")
+DOCUMENT_EXTENSIONS = (".pdf", ".docx")
+
+
+def is_spreadsheet_file(path: str) -> bool:
+    return os.path.splitext(str(path).lower())[1] in SPREADSHEET_EXTENSIONS
+
+
+def is_document_file(path: str) -> bool:
+    return os.path.splitext(str(path).lower())[1] in DOCUMENT_EXTENSIONS
+
+
+def extract_pdf_text(path: str, max_pages: int = 20, max_chars: int = 20000) -> str:
+    try:
+        from pypdf import PdfReader
+    except Exception as error:
+        raise RuntimeError("PDF 요청파일을 읽으려면 pypdf 패키지가 필요합니다.") from error
+
+    reader = PdfReader(path)
+    parts = []
+    for page_index, page in enumerate(reader.pages[:max_pages], 1):
+        text = page.extract_text() or ""
+        if text.strip():
+            parts.append(f"[페이지 {page_index}]\n{text.strip()}")
+        if sum(len(part) for part in parts) >= max_chars:
+            break
+    return "\n\n".join(parts)[:max_chars]
+
+
+def extract_docx_text(path: str, max_chars: int = 20000) -> str:
+    try:
+        from docx import Document
+    except Exception as error:
+        raise RuntimeError("Word 요청파일을 읽으려면 python-docx 패키지가 필요합니다.") from error
+
+    document = Document(path)
+    parts = []
+    for paragraph in document.paragraphs:
+        text = paragraph.text.strip()
+        if text:
+            parts.append(text)
+    for table_index, table in enumerate(document.tables, 1):
+        parts.append(f"[표 {table_index}]")
+        for row in table.rows[:80]:
+            values = [cell.text.strip().replace("\n", " ") for cell in row.cells]
+            if any(values):
+                parts.append(" | ".join(values))
+    return "\n".join(parts)[:max_chars]
+
+
+def analyze_request_file(path: str) -> dict:
+    ext = os.path.splitext(str(path).lower())[1]
+    if is_spreadsheet_file(path):
+        return analyze(path)
+    if ext == ".pdf":
+        return {"kind": "document", "file_type": "pdf", "text": extract_pdf_text(path), "sheets": []}
+    if ext == ".docx":
+        return {"kind": "document", "file_type": "docx", "text": extract_docx_text(path), "sheets": []}
+    raise ValueError(f"지원하지 않는 요청파일 형식입니다: {ext}")
+
+
 def parse_notes_filters(notes: str) -> dict:
     """
     추가 요청사항 텍스트에서 날짜 범위·필터 기준·연구자 목록을 파싱.
@@ -167,6 +228,17 @@ def extract_example_rows(corrected_file_bytes: bytes, target_sheet: str = None,
 def format_analysis_for_prompt(template_analysis, title="파일 내용"):
     """analyze_template 결과를 AI 프롬프트에 넣기 쉬운 텍스트로 변환."""
     text_parts = [f"\n## {title}"]
+    if template_analysis.get("kind") == "document":
+        file_type = template_analysis.get("file_type", "document").upper()
+        text = (template_analysis.get("text") or "").strip()
+        text_parts.append(f"\n### 문서 유형: {file_type}")
+        if text:
+            text_parts.append("### 추출 텍스트")
+            text_parts.append(text)
+        else:
+            text_parts.append("(문서에서 읽을 수 있는 텍스트를 찾지 못했습니다. 스캔본 PDF라면 OCR이 필요할 수 있습니다.)")
+        return "\n".join(text_parts)
+
     for sheet in template_analysis.get("sheets", []):
         rows = sheet.get("rows", [])
         text_parts.append(f"\n### 시트: {sheet['name']} (최대행:{sheet.get('max_row','?')}, 최대열:{sheet.get('max_col','?')})")
@@ -228,7 +300,7 @@ def extract_reference_values(reference_path, reference_filter):
     sheet_name = reference_filter.get("sheet")
     col = int(reference_filter.get("column") or reference_filter.get("col") or 0)
     start_row = int(reference_filter.get("data_start_row") or 2)
-    if col < 1:
+    if col < 1 or not is_spreadsheet_file(reference_path):
         return []
 
     wb = load_workbook(reference_path, data_only=True, read_only=True)
@@ -258,6 +330,8 @@ def infer_reference_filters(reference_paths, notes=""):
         return []
 
     for file_index, reference_path in enumerate(reference_paths, 1):
+        if not is_spreadsheet_file(reference_path):
+            continue
         wb = load_workbook(reference_path, data_only=True, read_only=True)
         for ws in wb.worksheets:
             max_scan_row = min(ws.max_row or 0, 10)
@@ -728,6 +802,7 @@ def get_mapping_from_openai(template_analysis, db_columns_text, transform_rules_
 ## 중요 원칙
 - 마스터 DB 파일은 항상 동일한 고정 스키마입니다. 요청파일들은 마스터 DB가 아니라 작성양식/작성요령/추출대상자 명단입니다.
 - 최종 결과를 채워 넣을 작성양식 파일 번호를 `output_file_index`로 지정하세요. 사용자가 자연어로 "요청파일 3 양식"처럼 말하면 그 번호를 따르세요.
+- PDF/Word 요청파일은 작성요령·인정기준·추출조건 참고자료입니다. 최종 결과를 채워 넣을 `output_file_index`는 반드시 Excel 요청파일(.xlsx/.xls) 번호여야 합니다.
 - 작성양식 파일 내부의 가이드 지침, 예시 데이터, 컬럼 헤더에 명시된 형식을 최우선으로 따르세요.
 - 작성요령 파일이 따로 있으면 인정기준, 제외대상, 기간 기준, 단위 규칙을 매핑에 반영하세요.
 - 추출대상자 명단 파일이 따로 있고 사용자가 "동일한 대상", "명단 기준", "교직원번호 기준" 등을 요청하면 `reference_filters`에 대상 필터를 작성하세요.
@@ -1501,14 +1576,28 @@ def run(master_path, template_path, year, output_path, notes="", hint="", api_ke
     request_analyses = []
     request_context_parts = []
     for idx, path in enumerate(request_file_paths, 1):
-        analysis = analyze(path)
+        analysis = analyze_request_file(path)
         analysis["_filename"] = request_file_names[idx - 1] if idx - 1 < len(request_file_names) else os.path.basename(path)
         request_analyses.append(analysis)
-        sheets_summary = [f"{s['name']}({len(s.get('rows',[]))}행)" for s in analysis["sheets"]]
-        print(f"  → 요청파일 {idx}: {analysis['_filename']} / 시트: {sheets_summary}")
+        if analysis.get("kind") == "document":
+            text_len = len(analysis.get("text") or "")
+            print(f"  → 요청파일 {idx}: {analysis['_filename']} / 문서({analysis.get('file_type')}, {text_len}자)")
+        else:
+            sheets_summary = [f"{s['name']}({len(s.get('rows',[]))}행)" for s in analysis["sheets"]]
+            print(f"  → 요청파일 {idx}: {analysis['_filename']} / 시트: {sheets_summary}")
         request_context_parts.append(format_analysis_for_prompt(analysis, f"요청파일 {idx}: {analysis['_filename']}"))
     template_analysis = request_analyses[0]
     request_files_context = "\n".join(request_context_parts)
+    spreadsheet_indices = [
+        idx for idx, path in enumerate(request_file_paths, 1)
+        if is_spreadsheet_file(path)
+    ]
+    if not spreadsheet_indices:
+        raise ValueError(
+            "작성양식으로 사용할 Excel 요청파일이 없습니다. "
+            "PDF/Word는 작성요령·참고자료로 읽을 수 있지만, 결과를 채울 최종 양식은 .xlsx/.xls 파일로 올려주세요. "
+            "양식이 없는 추출이라면 추가 요청사항에 '서식 없음'이라고 적어주세요."
+        )
 
     ref_dir = os.path.join(os.path.dirname(__file__), "..", "references")
     with open(os.path.join(ref_dir, "db_columns.md"), encoding="utf-8") as f:
@@ -1518,7 +1607,8 @@ def run(master_path, template_path, year, output_path, notes="", hint="", api_ke
 
     # 캐시 조회
     cache = load_cache()
-    cache_key, cached_mapping = find_cached_mapping(os.path.basename(request_file_paths[0]), cache)
+    cache_lookup_path = request_file_paths[spreadsheet_indices[0] - 1]
+    cache_key, cached_mapping = find_cached_mapping(os.path.basename(cache_lookup_path), cache)
     if cache_key:
         print(f"  📦 캐시 히트: '{cache_key}' 매핑을 참고 예시로 사용")
     else:
@@ -1546,6 +1636,13 @@ def run(master_path, template_path, year, output_path, notes="", hint="", api_ke
     # 워크북 로드 및 1차 매핑 검증
     output_file_index = int(mapping.get("output_file_index") or 1)
     output_file_index = max(1, min(output_file_index, len(request_file_paths)))
+    if not is_spreadsheet_file(request_file_paths[output_file_index - 1]):
+        fallback_index = spreadsheet_indices[-1]
+        print(
+            f"  ⚠️ AI가 요청파일 {output_file_index}을 최종 양식으로 선택했지만 Excel 파일이 아니므로 "
+            f"요청파일 {fallback_index} Excel 양식으로 전환합니다."
+        )
+        output_file_index = fallback_index
     output_template_path = request_file_paths[output_file_index - 1]
     print(f"  → 최종 작성양식: 요청파일 {output_file_index} ({request_file_names[output_file_index - 1]})")
     wb = load_workbook(output_template_path)
@@ -1573,6 +1670,13 @@ def run(master_path, template_path, year, output_path, notes="", hint="", api_ke
             return run_free_format(all_rows, request_file_paths[source_index - 1], mapping, year, output_path)
         output_file_index = int(mapping.get("output_file_index") or output_file_index)
         output_file_index = max(1, min(output_file_index, len(request_file_paths)))
+        if not is_spreadsheet_file(request_file_paths[output_file_index - 1]):
+            fallback_index = spreadsheet_indices[-1]
+            print(
+                f"  ⚠️ 재매핑 결과 요청파일 {output_file_index}이 Excel 파일이 아니므로 "
+                f"요청파일 {fallback_index} Excel 양식으로 전환합니다."
+            )
+            output_file_index = fallback_index
         output_template_path = request_file_paths[output_file_index - 1]
         wb = load_workbook(output_template_path)
         target_sheet = mapping.get("target_sheet", wb.sheetnames[0])
