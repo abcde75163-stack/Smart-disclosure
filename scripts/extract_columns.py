@@ -79,6 +79,78 @@ HEADER_MAP = {
 
 # 기본 추출 열 (요청사항이 없거나 불명확할 때)
 DEFAULT_COLUMNS = [0, 1, 3, 28, 29, 37, 44, 50, 52, 73, 76]
+SPREADSHEET_EXTENSIONS = (".xlsx", ".xlsm", ".xltx", ".xls")
+DOCUMENT_EXTENSIONS = (".pdf", ".docx")
+
+
+def is_spreadsheet_file(path: str) -> bool:
+    import os
+    return os.path.splitext(str(path).lower())[1] in SPREADSHEET_EXTENSIONS
+
+
+def extract_pdf_text(path: str, max_pages: int = 20, max_chars: int = 12000) -> str:
+    try:
+        from pypdf import PdfReader
+    except Exception as error:
+        raise RuntimeError("PDF 요청파일을 읽으려면 pypdf 패키지가 필요합니다.") from error
+
+    reader = PdfReader(path)
+    parts = []
+    for page_index, page in enumerate(reader.pages[:max_pages], 1):
+        text = page.extract_text() or ""
+        if text.strip():
+            parts.append(f"[페이지 {page_index}]\n{text.strip()}")
+        if sum(len(part) for part in parts) >= max_chars:
+            break
+    return "\n\n".join(parts)[:max_chars]
+
+
+def extract_docx_text(path: str, max_chars: int = 12000) -> str:
+    try:
+        from docx import Document
+    except Exception as error:
+        raise RuntimeError("Word 요청파일을 읽으려면 python-docx 패키지가 필요합니다.") from error
+
+    document = Document(path)
+    parts = [p.text.strip() for p in document.paragraphs if p.text.strip()]
+    for table_index, table in enumerate(document.tables, 1):
+        parts.append(f"[표 {table_index}]")
+        for row in table.rows[:60]:
+            values = [cell.text.strip().replace("\n", " ") for cell in row.cells]
+            if any(values):
+                parts.append(" | ".join(values))
+    return "\n".join(parts)[:max_chars]
+
+
+def build_request_files_context(request_file_paths=None, request_file_names=None) -> str:
+    request_file_paths = request_file_paths or []
+    request_file_names = request_file_names or []
+    parts = []
+    for idx, path in enumerate(request_file_paths, 1):
+        name = request_file_names[idx - 1] if idx - 1 < len(request_file_names) else os.path.basename(path)
+        ext = os.path.splitext(str(path).lower())[1]
+        parts.append(f"\n## 요청파일 {idx}: {name}")
+        if is_spreadsheet_file(path):
+            from openpyxl import load_workbook
+            wb = load_workbook(path, data_only=True, read_only=True)
+            for ws in wb.worksheets[:5]:
+                parts.append(f"### 시트: {ws.title}")
+                for r in range(1, min(ws.max_row or 0, 12) + 1):
+                    values = []
+                    for c in range(1, min(ws.max_column or 0, 12) + 1):
+                        value = ws.cell(r, c).value
+                        if value not in (None, ""):
+                            values.append(f"[열{c}]{str(value).strip()}")
+                    if values:
+                        parts.append(f"행{r}: " + ", ".join(values))
+            wb.close()
+        elif ext == ".pdf":
+            parts.append("### 문서 유형: PDF")
+            parts.append(extract_pdf_text(path))
+        elif ext == ".docx":
+            parts.append("### 문서 유형: Word")
+            parts.append(extract_docx_text(path))
+    return "\n".join(parts)
 
 REQUEST_COLUMN_ALIASES = [
     ("계약일", 1),
@@ -126,7 +198,7 @@ def describe_columns(columns: list) -> list:
     ]
 
 
-def ask_openai(notes: str, year: int, api_key: str) -> dict:
+def ask_openai(notes: str, year: int, api_key: str, request_files_context: str = "") -> dict:
     """
     추가 요청사항을 분석해서 추출할 열과 필터 조건을 반환.
     반환 형식:
@@ -151,6 +223,9 @@ def ask_openai(notes: str, year: int, api_key: str) -> dict:
 
 ## 사용자 추가 요청사항:
 {notes if notes.strip() else "(없음 - 기본 주요 항목을 추출)"}
+
+## 요청파일 참고 내용:
+{request_files_context if request_files_context.strip() else "(없음)"}
 
 ## 응답 형식 (JSON만 출력, 다른 텍스트 없이):
 {{
@@ -383,7 +458,7 @@ def _extract_reference_values(reference_path, reference_filter):
     sheet_name = reference_filter.get("sheet")
     col = int(reference_filter.get("column") or 0)
     start_row = int(reference_filter.get("data_start_row") or 2)
-    if col < 1:
+    if col < 1 or not is_spreadsheet_file(reference_path):
         return []
 
     wb = load_workbook(reference_path, data_only=True, read_only=True)
@@ -408,6 +483,8 @@ def infer_reference_filters(request_file_paths, notes=""):
 
     from openpyxl import load_workbook
     for file_index, path in enumerate(request_file_paths, 1):
+        if not is_spreadsheet_file(path):
+            continue
         wb = load_workbook(path, data_only=True, read_only=True)
         for ws in wb.worksheets:
             for r in range(1, min(ws.max_row or 0, 10) + 1):
@@ -514,6 +591,9 @@ def run(master_path: str, year: int, output_path: str,
     request_file_names = request_file_names or []
     print(f"  전체 행수: {len(all_rows)}")
     diagnostics = [{"step": "마스터 DB 로딩", "before": None, "after": len(all_rows)}]
+    request_files_context = build_request_files_context(request_file_paths, request_file_names)
+    if request_files_context.strip():
+        print(f"  요청파일 참고 내용 분석: {len(request_files_context)}자")
 
     # ── 마스터 DB 유효성 검증 ────────────────────────────────────────
     if all_rows and len(all_rows[0]) < 50:
@@ -561,7 +641,7 @@ def run(master_path: str, year: int, output_path: str,
     # ── AI에게 열 및 필터 결정 요청 ────────────────────────────────
     print("[extract_columns] AI 분석 중...")
     try:
-        ai_result = ask_openai(notes, year, api_key)
+        ai_result = ask_openai(notes, year, api_key, request_files_context=request_files_context)
         columns           = ai_result.get("columns") or []
         filter_mode       = ai_result.get("filter_mode", "both")
         filter_year       = ai_result.get("filter_year") or year
