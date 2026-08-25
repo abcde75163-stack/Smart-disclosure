@@ -218,10 +218,10 @@ with col_l:
 with col_r:
     st.markdown('<div class="upload-label">📋 요청파일 <span style="color:#9CA3AF;font-weight:400">(선택, 여러 개 가능)</span></div>', unsafe_allow_html=True)
     request_files = st.file_uploader(
-        "request_files", type=["xlsx", "xls"], key="request_files",
+        "request_files", type=["xlsx", "xls", "pdf", "docx"], key="request_files",
         accept_multiple_files=True,
         label_visibility="collapsed",
-        help="작성양식, 작성요령, 추출대상자 명단 등을 함께 올릴 수 있습니다. 어떤 파일이 어떤 역할인지는 아래 요청사항에 자연어로 적어주세요."
+        help="작성양식 Excel, 작성요령 PDF/Word, 추출대상자 명단 등을 함께 올릴 수 있습니다. 어떤 파일이 어떤 역할인지는 아래 요청사항에 자연어로 적어주세요."
     )
     if request_files:
         hint = " / ".join(filter(None, [detect_hint(f.name) for f in request_files]))
@@ -232,7 +232,7 @@ with col_r:
         st.markdown(badges, unsafe_allow_html=True)
     else:
         hint = ""
-        st.markdown('<div class="upload-hint">작성양식·작성요령·대상자 명단 등</div>', unsafe_allow_html=True)
+        st.markdown('<div class="upload-hint">작성양식 Excel · 작성요령 PDF/Word · 대상자 명단 등</div>', unsafe_allow_html=True)
 
 st.markdown("---")
 
