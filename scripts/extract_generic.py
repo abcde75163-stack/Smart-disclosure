@@ -1097,7 +1097,7 @@ def aggregate_by_contract(rows, year):
         r     = info["row"]
         pay   = info["total_pay"]
         years = sorted(info["pay_years"])
-        py    = year if year in years else (years[-1] if years else year)
+        py    = ", ".join(str(y) for y in years) if years else "확인 필요"
         # aggregate row에 total_pay 저장 (col 76 override)
         row_list = list(r)
         # 입금 집계값을 별도 속성으로 전달할 수 없으므로 tuple에 붙이기
@@ -1488,7 +1488,7 @@ def apply_mapping(ws, rows_data, mapping, data_start, group_by_contract, year):
         else:
             row = row_entry
             pay_amt  = safe_int(row[76])
-            pay_year = get_year(row[73]) or year
+            pay_year = get_year(row[73]) or "확인 필요"
 
         for col_def in columns:
             col      = col_def.get("col")
